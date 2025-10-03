@@ -41,8 +41,25 @@ COP_slope_source = 0.02
 T_source = 5.0
 T_cold = 10.0
 
-# Hot water draws (could make user-editable later)
-draws = [(7, 0, 80), (7, 30, 20), (18, 0, 50)]
+# Hot water draws 
+st.sidebar.subheader("Hot water draws")
+
+# Default schedule
+default_draws = pd.DataFrame({
+    "Hour": [7, 7, 18],
+    "Minute": [0, 30, 0],
+    "Volume (L)": [80, 20, 50]
+})
+
+# Editable table
+draws_df = st.sidebar.data_editor(
+    default_draws,
+    num_rows="dynamic",
+    use_container_width=True
+)
+
+# Convert dataframe back to list of tuples
+draws = list(draws_df.itertuples(index=False, name=None))
 
 # --------------------- SIMULATION ---------------------
 steps = int(sim_hours * 60 / dt_min)
