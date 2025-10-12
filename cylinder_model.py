@@ -2,10 +2,32 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import altair as alt
+from openai import OpenAI
+import json
+import re
 
 # --------------------- STREAMLIT CONFIG ---------------------
-st.set_page_config(page_title="Hot Water Tank Simulation", layout="wide")
-st.title("Hot Water Tank + Heat Pump + Coil Simulation")
+st.set_page_config(page_title="Vaillant cylinder simlation", layout="wide")
+st.title("Vaillant cylinder simlation")
+
+# --------------------- PARAMETER PARSING FUNCTION ---------------------
+def parse_parameter_change(prompt: str):
+    patterns = {
+        "setpoint": r"setpoint\s*(?:to|=)?\s*(\d+\.?\d*)",
+        "tank_volume_l": r"(?:tank volume|volume)\s*(?:to|=)?\s*(\d+\.?\d*)",
+        "T_ambient": r"(?:ambient temp|ambient temperature)\s*(?:to|=)?\s*(-?\d+\.?\d*)",
+        "T_coil_in": r"(?:coil inlet temp|coil temperature)\s*(?:to|=)?\s*(\d+\.?\d*)",
+        "sim_hours": r"(?:simulation hours|hours)\s*(?:to|=)?\s*(\d+\.?\d*)",
+    }
+    updates = {}
+    for key, pattern in patterns.items():
+        match = re.search(pattern, prompt.lower())
+        if match:
+            try:
+                updates[key] = float(match.group(1))
+            except ValueError:
+                pass
+    return updates
 
 # --------------------- USER INPUTS ---------------------
 st.sidebar.header("Simulation Parameters")
@@ -258,3 +280,138 @@ elif chart_mode == "Losses":
     ).properties(title="Tank Losses vs Time", width=750, height=400).interactive()
     st.altair_chart(chart_losses, use_container_width=True)
     reset_zoom_button()
+
+    # --------------------- DATAFRAMES FOR PLOTTING ---------------------
+df = pd.DataFrame({
+    "Time (hours)": time,
+    "Tank Temperature (°C)": T_tank,
+    "HP Power (W)": hp_power_el,
+    "COP": COP_series,
+    "Losses (W)": Q_losses,
+    "Q_from_HP (W)": Q_from_hp,
+    "Q_from_Coil (W)": Q_coil_series,
+    "Coil Outlet Temp (°C)": T_coil_out_series,
+})
+df["Energy_HP (kWh)"] = np.cumsum(Q_from_hp) * (dt_min / 60.0) / 1000.0
+df["Energy_Coil (kWh)"] = np.cumsum(Q_coil_series) * (dt_min / 60.0) / 1000.0
+df_energy = df.melt(id_vars=["Time (hours)"], value_vars=["Energy_HP (kWh)", "Energy_Coil (kWh)"],
+                    var_name="Source", value_name="Cumulative Energy (kWh)")
+
+df_cop = df[["Time (hours)", "COP"]]
+df_temp = df[["Time (hours)", "Tank Temperature (°C)"]]
+df_power = df[["Time (hours)", "HP Power (W)"]]
+df_losses = df[["Time (hours)", "Losses (W)"]]
+df_coil = df[["Time (hours)", "Coil Outlet Temp (°C)", "Q_from_Coil (W)"]]
+
+    # --------------------- CYLINDER TAPPINGS UPLOAD ---------------------
+st.subheader("🧾 Cylinder Tappings Upload and Visualization")
+uploaded_tappings = st.file_uploader("Upload Cylinder Tappings CSV", type=["csv"])
+df_tappings = None
+if uploaded_tappings:
+    try:
+        df_tappings = pd.read_csv(uploaded_tappings)
+        st.success("✅ Cylinder tapping data loaded successfully.")
+        st.dataframe(df_tappings, use_container_width=True)
+        height_col = next(c for c in df_tappings.columns if "height" in c.lower())
+        temp_col = next(c for c in df_tappings.columns if "temp" in c.lower())
+        chart_tappings = alt.Chart(df_tappings).mark_point(color="blue").encode(
+            x=alt.X(f"{temp_col}:Q", title="Temperature (°C)"),
+            y=alt.Y(f"{height_col}:Q", title="Height (m)")
+        ).properties(title="Measured Cylinder Temperature Profile", width=600, height=400)
+        st.altair_chart(chart_tappings, use_container_width=True)
+    except Exception as e:
+        st.error(f"❌ Error reading file: {e}")
+
+    # --------------------- HELPER: CHART GENERATOR ---------------------
+def generate_chart(key: str):
+    if key == "temperature":
+        base = alt.Chart(df).mark_line(color="red").encode(x="Time (hours)", y="Tank Temperature (°C)")
+        if df_tappings is not None:
+            base += alt.Chart(df_tappings).mark_point(color="blue").encode(
+                x=alt.X("Temperature:Q", title="Temperature (°C)"),
+                y=alt.Y("Height:Q", title="Height (m)")
+            )
+        return base
+    elif key == "cop":
+        return alt.Chart(df_cop).mark_line(color="green").encode(x="Time (hours)", y="COP")
+    elif key == "power":
+        return alt.Chart(df_power).mark_line(color="orange").encode(x="Time (hours)", y="HP Power (W)")
+    elif key == "coil":
+        return alt.Chart(df_coil).mark_line(color="purple").encode(x="Time (hours)", y="Coil Outlet Temp (°C)")
+    elif key == "loss":
+        return alt.Chart(df_losses).mark_line(color="gray").encode(x="Time (hours)", y="Losses (W)")
+    elif key == "energy":
+        return alt.Chart(df_energy).mark_line().encode(x="Time (hours)", y="Cumulative Energy (kWh)", color="Source")
+    return None
+
+# --------------------- GPT-POWERED INTERACTIVE CHATBOT ---------------------
+st.subheader("🤖 Interactive Simulation Copilot")
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "simulation_updates" not in st.session_state:
+    st.session_state.simulation_updates = {}
+
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+
+client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+
+system_prompt = f"""
+You are an expert assistant for hot water tank simulations.
+You can explain results, detect patterns, compare measured and simulated data,
+and interpret efficiency behavior from the charts.
+Here is the latest simulation summary:
+{json.dumps(summary, indent=2)}
+"""
+
+prompt = st.chat_input("Ask about the simulation or say 'show COP chart'...")
+
+if prompt:
+    st.chat_message("user").markdown(prompt)
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    updates = parse_parameter_change(prompt)
+    if updates:
+        st.session_state.simulation_updates.update(updates)
+        msg = f"Detected parameter change: {updates}. 🔁 Rerunning simulation..."
+        st.chat_message("assistant").markdown(msg)
+        st.session_state.messages.append({"role": "assistant", "content": msg})
+        st.experimental_rerun()
+    elif any(word in prompt.lower() for word in ["chart", "plot", "graph", "show"]):
+        for key in ["temperature", "cop", "power", "coil", "loss", "energy"]:
+            if key in prompt.lower():
+                chart = generate_chart(key)
+                if chart:
+                    st.chat_message("assistant").markdown(f"📊 Here's the **{key.capitalize()}** chart:")
+                    st.altair_chart(chart, use_container_width=True)
+                    explanation = f"I've plotted the {key} data — {('showing both simulated and measured data' if df_tappings is not None else 'based on the simulation results only')}."
+                    st.chat_message("assistant").markdown(explanation)
+                    st.session_state.messages.append({"role": "assistant", "content": explanation})
+                    break
+    elif df_tappings is not None and "compare" in prompt.lower():
+        avg_sim = df_temp["Tank Temperature (°C)"].mean()
+        avg_meas = df_tappings.iloc[:, 1].mean()
+        diff = avg_meas - avg_sim
+        diag = (
+            f"The measured temperatures average {avg_meas:.1f}°C vs simulated {avg_sim:.1f}°C "
+            f"→ difference of {diff:+.1f}°C. "
+            + ("Measured tank is warmer — possible calibration or stratification effect." if diff > 0 else
+               "Measured tank is cooler — could indicate higher losses or draw rates.")
+        )
+        st.chat_message("assistant").markdown("📈 Comparison between measured and simulated data:")
+        st.chat_message("assistant").markdown(diag)
+        st.session_state.messages.append({"role": "assistant", "content": diag})
+    else:
+        messages = [{"role": "system", "content": system_prompt}] + st.session_state.messages
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                response = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=messages,
+                    max_tokens=400,
+                    temperature=0.5
+                )
+                reply = response.choices[0].message.content
+                st.markdown(reply)
+        st.session_state.messages.append({"role": "assistant", "content": reply})
