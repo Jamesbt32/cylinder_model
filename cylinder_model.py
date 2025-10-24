@@ -1,417 +1,387 @@
+# --- cylinder_model_multilayer.py ---
+# Multi-layer stratified tank + modulating HP simulation
+# Includes summary, dropdown graph viewer, AI assistant, and tapping validation
+
+import streamlit as st
 import numpy as np
 import pandas as pd
-import streamlit as st
 import altair as alt
-from openai import OpenAI
-import json
-import re
+import os
 
-# --------------------- STREAMLIT CONFIG ---------------------
-st.set_page_config(page_title="Vaillant cylinder simlation", layout="wide")
-st.title("Vaillant cylinder simlation")
+import streamlit as st
+import base64
 
-# --------------------- PARAMETER PARSING FUNCTION ---------------------
-def parse_parameter_change(prompt: str):
-    patterns = {
-        "setpoint": r"setpoint\s*(?:to|=)?\s*(\d+\.?\d*)",
-        "tank_volume_l": r"(?:tank volume|volume)\s*(?:to|=)?\s*(\d+\.?\d*)",
-        "T_ambient": r"(?:ambient temp|ambient temperature)\s*(?:to|=)?\s*(-?\d+\.?\d*)",
-        "T_coil_in": r"(?:coil inlet temp|coil temperature)\s*(?:to|=)?\s*(\d+\.?\d*)",
-        "sim_hours": r"(?:simulation hours|hours)\s*(?:to|=)?\s*(\d+\.?\d*)",
-    }
-    updates = {}
-    for key, pattern in patterns.items():
-        match = re.search(pattern, prompt.lower())
-        if match:
-            try:
-                updates[key] = float(match.group(1))
-            except ValueError:
-                pass
-    return updates
+st.set_page_config(page_title="Vaillant Cylinder Model", layout="wide")
 
-# --------------------- USER INPUTS ---------------------
-st.sidebar.header("Simulation Parameters")
-dt_min = st.sidebar.number_input("Time step (minutes)", 1, 60, 1)
-sim_hours = st.sidebar.slider("Simulation hours", 1, 72, 24)
-tank_volume_l = st.sidebar.number_input("Tank volume (L)", 50, 1000, 200)
-tank_height = st.sidebar.number_input("Tank height (m)", 0.5, 3.0, 1.2)
-U_tank = st.sidebar.slider("Tank insulation U-value (W/m²K)", 0.5, 10.0, 3.0)
-T_ambient = st.sidebar.number_input("Ambient temperature (°C)", -10.0, 30.0, 10.0)
-setpoint = st.sidebar.slider("Tank setpoint (°C)", 30.0, 70.0, 50.0)
-hysteresis = st.sidebar.slider("Thermostat hysteresis (°C)", 1.0, 10.0, 3.0)
+# Load and encode your logo
+with open("src/src/vaillant_logo.png", "rb") as file:
+    data = base64.b64encode(file.read()).decode("utf-8")
 
-st.sidebar.subheader("Coil Parameters")
-coil_area = st.sidebar.number_input("Coil area (m²)", 0.1, 10.0, 1.5)
-U_ref = st.sidebar.number_input("Reference U (W/m²K)", 100.0, 2000.0, 800.0)
-flow_ref = st.sidebar.number_input("Reference flow rate (L/min)", 1.0, 50.0, 10.0)
-coil_flow_rate_lpm = st.sidebar.number_input("Actual coil flow rate (L/min)", 1.0, 50.0, 10.0)
-T_coil_in = st.sidebar.number_input("Coil inlet temperature (°C)", 10.0, 80.0, 55.0)
-n_flow = 0.6
+# Use an f-string to insert the base64 image data
+st.markdown(
+    f"""
+    <div style="text-align: center; padding-top: 10px; padding-bottom: 10px;">
+        <img src="data:image/png;base64,{data}" width="200">
+        <h1 style="margin-top: 10px;">Vaillant Cylinder Model Simulation</h1>
+    </div>
+    <hr style="border:1px solid #ccc;">
+    """,
+    unsafe_allow_html=True
+)
 
-st.sidebar.subheader("Heat Pump Parameters")
-P_el_max = 2000.0
-COP_nominal = 3.5
-T_ref_sink = 45.0
-COP_slope_sink = 0.03
-COP_slope_source = 0.02
-T_source = 5.0
-T_cold = 10.0
 
-# --------------------- HOT WATER DRAWS ---------------------
-st.sidebar.subheader("Hot Water Draws")
 
-if "draws" not in st.session_state:
-    st.session_state.draws = []
 
-with st.sidebar.form("draw_form", clear_on_submit=True):
-    new_hour = st.number_input("Hour (0–23)", 0, 23, 7, key="hour_input")
-    new_minute = st.number_input("Minute (0–59)", 0, 59, 0, key="minute_input")
-    new_volume = st.number_input("Volume (L)", 1, 500, 50, key="volume_input")
-    add_clicked = st.form_submit_button("➕ Add Draw")
+# Optional AI assistant
+try:
+    from openai import OpenAI
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) if os.getenv("OPENAI_API_KEY") else None
+except Exception:
+    client = None
 
-if add_clicked:
-    st.session_state.draws.append((int(new_hour), int(new_minute), float(new_volume)))
-
-if st.sidebar.button("🗑️ Clear All Draws"):
-    st.session_state.draws = []
-
-if st.session_state.draws:
-    df_draws = pd.DataFrame(st.session_state.draws, columns=["Hour", "Minute", "Volume (L)"])
-    st.sidebar.dataframe(df_draws, use_container_width=True, hide_index=True)
-else:
-    st.sidebar.info("No draws added yet.")
-
-draws = st.session_state.draws
-
-# --------------------- FIXED PARAMETERS ---------------------
+# --- Global constants ---
 rho = 1000.0
 c_p = 4186.0
-tank_volume_m3 = tank_volume_l / 1000.0
-tank_radius = np.sqrt(tank_volume_m3 / (np.pi * tank_height))
-tank_area = 2 * np.pi * tank_radius * tank_height + 2 * np.pi * tank_radius**2
-tank_mass = tank_volume_m3 * rho
-UA_tank = U_tank * tank_area
+P_EL_MAX = 5000.0  # W nominal
 
-coil_U = U_ref * (coil_flow_rate_lpm / flow_ref) ** n_flow
-coil_UA = coil_U * coil_area
-m_dot_coil = coil_flow_rate_lpm / 60.0 / 1000.0 * rho
 
-# --------------------- SIMULATION ---------------------
-steps = int(sim_hours * 60 / dt_min)
-time = np.arange(0, steps * dt_min, dt_min) / 60.0
-
-T_tank = np.zeros(steps)
-hp_power_el = np.zeros(steps)
-hp_on = np.zeros(steps, dtype=bool)
-Q_from_hp = np.zeros(steps)
-Q_losses = np.zeros(steps)
-COP_series = np.zeros(steps)
-Q_coil_series = np.zeros(steps)
-T_coil_out_series = np.zeros(steps)
-T_tank[0] = 45.0
-
-draw_events = {}
-for h, m, v in draws:
-    idx = int((h * 60 + m) / dt_min)
-    if idx < steps:
-        draw_events.setdefault(idx, 0.0)
-        draw_events[idx] += v
-
-for k in range(1, steps):
-    T_prev = T_tank[k - 1]
-
-    # Hot water draw
-    if k in draw_events:
-        vol = draw_events[k]
-        if vol >= tank_volume_l:
-            T_prev = T_cold
-        else:
-            m_tank = tank_mass
-            m_draw = vol / 1000.0 * rho
-            m_remain = m_tank - m_draw
-            E_remain = m_remain * c_p * T_prev
-            E_in = m_draw * c_p * T_cold
-            T_prev = (E_remain + E_in) / (m_tank * c_p)
-
-    # Thermostat
-    if T_prev <= (setpoint - hysteresis):
-        hp_should_on = True
-    elif T_prev >= setpoint:
-        hp_should_on = False
+# --- Empirical Heat Pump model ---
+def solve_hp(T_tank, mod, Pmax, Pmin, Pmin_ratio):
+    if mod < Pmin_ratio:
+        Pel = 0.0
     else:
-        hp_should_on = bool(hp_on[k - 1])
+        frac = (mod - Pmin_ratio) / (1 - Pmin_ratio)
+        Pel = Pmin + (Pmax - Pmin) * frac
+    COP = max(4.0 - 0.1 * (T_tank - 45.0), 1.0)
+    Qhp = Pel * COP
+    return Qhp, Pel, COP
 
-    # COP model
-    COP = COP_nominal - COP_slope_sink * (T_prev - T_ref_sink) + COP_slope_source * (T_source - 5.0)
-    COP = max(1.0, COP)
-    COP_series[k] = COP
 
-    # Heat pump operation
-    if hp_should_on:
-        Q_dot_hp = P_el_max * COP
-        P_el = P_el_max
-        hp_on[k] = True
-    else:
-        Q_dot_hp = 0.0
-        P_el = 0.0
-        hp_on[k] = False
+# --- Simulation function ---
+@st.cache_data
+def run_sim(dt_min, sim_hrs, Vtank, Utank, Tamb, setp, hyst,
+             Pmin, Pmax, Tsrc, tap, N_layers=5):
+    """Multi-layer stratified tank simulation with modulating HP."""
 
-    Q_loss = UA_tank * (T_prev - T_ambient)
-    Q_dot_coil = coil_UA * (T_coil_in - T_prev)
-    if m_dot_coil > 0:
-        T_coil_out = T_coil_in - Q_dot_coil / (m_dot_coil * c_p)
-    else:
-        T_coil_out = T_coil_in
+    # --- Validate tapping data ---
+    if not all(k in tap for k in ["time", "volume", "rate_lpm"]):
+        raise ValueError("Tapping data missing required keys (time, volume, rate_lpm).")
+    if len(tap["time"]) == 0:
+        st.warning("⚠️ No tapping events defined. Running without hot water draws.")
 
-    Q_net = Q_dot_hp + Q_dot_coil - Q_loss
-    dt_s = dt_min * 60.0
-    dT = (Q_net * dt_s) / (tank_mass * c_p)
-    T_new = T_prev + dT
+    # Convert tapping lists → NumPy arrays
+    tap_time = np.array(tap["time"])
+    tap_vol = np.array(tap["volume"])
+    tap_rate = np.array(tap["rate_lpm"])
 
-    T_tank[k] = T_new
-    hp_power_el[k] = P_el
-    Q_from_hp[k] = Q_dot_hp
-    Q_losses[k] = Q_loss
-    Q_coil_series[k] = Q_dot_coil
-    T_coil_out_series[k] = T_coil_out
+    # --- Derived constants ---
+    Vtank_m3 = Vtank / 1000
+    m_total = rho * Vtank_m3
+    m_layer = m_total / N_layers
+    dt_s = dt_min * 60
+    steps = int(sim_hrs * 60 / dt_min)
+    time = np.arange(0, steps * dt_min, dt_min) / 60
 
-# --------------------- POSTPROCESS ---------------------
-total_el_kwh = np.sum(hp_power_el) * (dt_min / 60.0) / 1000.0
-total_heat_kwh = np.sum(Q_from_hp) * (dt_min / 60.0) / 1000.0
-total_losses_kwh = np.sum(Q_losses) * (dt_min / 60.0) / 1000.0
-total_coil_kwh = np.sum(Q_coil_series) * (dt_min / 60.0) / 1000.0
-on_minutes = np.sum(hp_on)
+    # --- Geometry & heat transfer ---
+    H = 1.5
+    D = np.sqrt(Vtank_m3 / (H * np.pi / 4))
+    A_cross = np.pi * (D / 2)**2
+    A_side = np.pi * D * H
+    A_total = A_side + 2 * A_cross
+    UA_loss = Utank * A_total / N_layers
+    U_int = 50.0
+    A_int = A_cross
+    UA_int = U_int * A_int / (H / N_layers)
 
-summary = {
-    "Simulation hours": sim_hours,
-    "Tank volume (L)": tank_volume_l,
-    "Total HP electrical energy (kWh)": round(total_el_kwh, 3),
-    "Total heat delivered by HP (kWh)": round(total_heat_kwh, 3),
-    "Total heat from coil (kWh)": round(total_coil_kwh, 3),
-    "Total losses (kWh)": round(total_losses_kwh, 3),
-    "HP run time (minutes)": int(on_minutes),
-    "Average COP": round((total_heat_kwh / total_el_kwh) if total_el_kwh > 0 else 0.0, 2),
-}
-st.subheader("Simulation Summary")
-st.dataframe(pd.DataFrame.from_dict(summary, orient="index", columns=["Value"]))
+    # --- HP control setup ---
+    Pmax_W = P_EL_MAX * Pmax
+    Pmin_W = Pmax_W * Pmin
+    Ton = setp - hyst
+    coil_bottom_idx = max(1, int(N_layers * 0.3))  # inject in bottom 30%
 
-# --------------------- DATAFRAMES FOR PLOTTING ---------------------
-df = pd.DataFrame({
-    "Time (hours)": time,
-    "Tank Temperature (°C)": T_tank,
-    "HP Power (W)": hp_power_el,
-    "COP": COP_series,
-    "Losses (W)": Q_losses,
-    "Q_from_HP (W)": Q_from_hp,
-    "Q_from_Coil (W)": Q_coil_series,
-    "Coil Outlet Temp (°C)": T_coil_out_series
-})
-df["Energy_HP (kWh)"] = np.cumsum(Q_from_hp) * (dt_min / 60.0) / 1000.0
-df["Energy_Coil (kWh)"] = np.cumsum(Q_coil_series) * (dt_min / 60.0) / 1000.0
-df_energy = df.melt(
-    id_vars=["Time (hours)"],
-    value_vars=["Energy_HP (kWh)", "Energy_Coil (kWh)"],
-    var_name="Source",
-    value_name="Cumulative Energy (kWh)"
-)
+    # --- Initialize arrays ---
+    T = np.zeros((steps, N_layers))
+    Qhp = np.zeros(steps)
+    Pel = np.zeros(steps)
+    COPs = np.zeros(steps)
+    HPon = np.zeros(steps, bool)
+    Qloss_total = np.zeros(steps)
+    Tap_flow = np.zeros(steps)
+    Tap_temp = np.zeros(steps)
+    Mod_frac = np.zeros(steps)
 
-# --------------------- CHART SELECTION ---------------------
-chart_mode = st.sidebar.selectbox(
-    "Choose chart mode",
-    options=["Tank Temperature", "Heat pump power", "COP vs Time", "Coil Temps", "Energy", "Losses"]
-)
+    # Initial temperature gradient
+    for i in range(N_layers):
+        T[0, i] = setp - 5 * (i / (N_layers - 1))
 
-def reset_zoom_button():
-    if st.button("🔄 Reset Zoom"):
-        st.experimental_rerun()
+    # --- Main simulation loop ---
+    for k in range(1, steps):
+        T_prev = T[k - 1, :].copy()
+        T_new = T_prev.copy()
+        T_top = T_prev[-1]
+        T_bottom = T_prev[0]
+        tnow = k * dt_min
 
-# --------------------- PLOTTING ---------------------
-if chart_mode == "Tank Temperature":
-    chart_temp = alt.Chart(df).mark_line(color="orange").encode(
-        x="Time (hours)", y="Tank Temperature (°C)",
-        tooltip=["Time (hours)", "Tank Temperature (°C)"]
-    ).properties(title="Tank Temperature vs Time", width=750, height=300).interactive()
+        # 1. HP control
+        mod = 0
+        on = False
+        if T_top < setp:
+            on = True
+            if T_top <= Ton:
+                mod = 1
+            else:
+                raw = (setp - T_top) / hyst
+                mod = Pmin + (1 - Pmin) * np.clip(raw, 0, 1)
+        if mod < Pmin:
+            on = False
+            mod = 0
+        Mod_frac[k] = mod
 
-    st.altair_chart(chart_temp, use_container_width=True)
-    reset_zoom_button()
+        Q = Pe = COP = 0
+        if on:
+            Q, Pe, COP = solve_hp(T_bottom, mod, Pmax_W, Pmin_W, Pmin)
+        HPon[k] = on
+        Qhp[k] = Q
+        Pel[k] = Pe
+        COPs[k] = COP
 
-    # Separate heat pump power chart
-elif chart_mode == "Heat pump power":
-    chart_power = alt.Chart(df).mark_line(color="red").encode(
-        x="Time (hours)", y="HP Power (W)",
-        tooltip=["Time (hours)", "HP Power (W)"]
-    ).properties(title="Heat Pump Power vs Time", width=750, height=300).interactive()
+        # 2. Tapping (top draw, bottom refill)
+        idx = np.where((tap_time > tnow - dt_min) & (tap_time <= tnow))[0]
+        Vtap = np.sum(tap_vol[idx]) if idx.size > 0 else 0
+        mdot_tap = (Vtap / 1000) * rho / dt_s
+        Tap_flow[k] = np.sum(tap_rate[idx]) if idx.size > 0 else 0
+        Tap_temp[k] = T_top
 
-    st.altair_chart(chart_power, use_container_width=True)
-    reset_zoom_button()
+        # 3. Layer balances
+        for i in range(N_layers):
+            Q_net = 0.0
+            if i > 0:
+                Q_up = UA_int * (T_prev[i - 1] - T_prev[i])
+                Q_net += Q_up
+            if i < N_layers - 1:
+                Q_down = UA_int * (T_prev[i + 1] - T_prev[i])
+                Q_net += Q_down
+            Q_loss = UA_loss * (T_prev[i] - Tamb)
+            Q_net -= Q_loss
+            Qloss_total[k] += Q_loss
+            if i < coil_bottom_idx:
+                Q_net += Qhp[k] / coil_bottom_idx
+            if i == N_layers - 1:
+                Q_net -= mdot_tap * c_p * T_prev[i]
+            elif i == 0:
+                Q_net += mdot_tap * c_p * Tamb
+            dT = Q_net * dt_s / (m_layer * c_p)
+            T_new[i] = np.clip(T_prev[i] + dT, 0, 100)
 
-elif chart_mode == "COP vs Time":
-    chart_cop = alt.Chart(df).mark_line(color="green", strokeWidth=2).encode(
-        x="Time (hours)", y="COP",
-        tooltip=["Time (hours)", "COP"]
-    ).properties(title="Heat Pump COP vs Time", width=750, height=400).interactive()
-    st.altair_chart(chart_cop, use_container_width=True)
-    reset_zoom_button()
+        # Enforce stratification
+        for i in range(N_layers - 1):
+            if T_new[i] > T_new[i + 1]:
+                avg = 0.5 * (T_new[i] + T_new[i + 1])
+                T_new[i] = avg
+                T_new[i + 1] = avg
+        T[k, :] = T_new
 
-elif chart_mode == "Coil Temps":
-    coil_temp_long = df.melt(
-        id_vars=["Time (hours)"], value_vars=["Coil Outlet Temp (°C)"],
-        var_name="Temperature Type", value_name="Temperature (°C)"
+    # --- Results ---
+    df = pd.DataFrame({
+        "Time (h)": time,
+        "HP Power (W)": Pel,
+        "HP Heat (W)": Qhp,
+        "COP": COPs,
+        "HP_On": HPon,
+        "Modulation": Mod_frac,
+        "Tap Flow (L/min)": Tap_flow,
+        "Tap Temp (°C)": Tap_temp,
+        "Q_Loss (W)": Qloss_total,
+    })
+    for i in range(N_layers):
+        df[f"T_Layer{i+1} (°C)"] = T[:, i]
+    df["T_Avg (°C)"] = T.mean(axis=1)
+
+    # Energy summary
+    dt_s = dt_min * 60
+    total_heat_kWh = df["HP Heat (W)"].sum() * dt_s / 3.6e6
+    total_power_kWh = df["HP Power (W)"].sum() * dt_s / 3.6e6
+    total_losses_kWh = df["Q_Loss (W)"].sum() * dt_s / 3.6e6
+    hp_runtime_min = np.sum(df["HP_On"]) * dt_min
+    avg_cop = total_heat_kWh / total_power_kWh if total_power_kWh > 0 else 0
+
+    summary = {
+        "Simulation Hours": sim_hrs,
+        "Tank Volume (L)": Vtank,
+        "Total HP Electrical Energy (kWh)": total_power_kWh,
+        "Total Heat Delivered by HP (kWh)": total_heat_kWh,
+        "Total Heat from Coil (kWh)": total_heat_kWh,
+        "Total Losses (kWh)": total_losses_kWh,
+        "HP Run Time (minutes)": hp_runtime_min,
+        "Average COP": avg_cop,
+    }
+    return df, summary
+
+
+# --- Charts ---
+def chart_stratification(df):
+    cols = [c for c in df.columns if c.startswith("T_Layer")]
+    d = df.melt("Time (h)", value_vars=cols, var_name="Layer", value_name="Temp (°C)")
+    return alt.Chart(d).mark_line().encode(
+        x="Time (h)", y="Temp (°C)", color="Layer:N"
+    ).properties(height=400, title="Tank Stratification (Multi-Layer)").interactive()
+
+
+def chart_modulation(df):
+    base = alt.Chart(df).mark_area(opacity=0.5, color="#2563eb").encode(
+        x="Time (h)",
+        y=alt.Y("Modulation:Q", title="Modulation Fraction (0–1)"),
+        tooltip=["Time (h)", "Modulation"]
     )
-    chart_coil_temps = alt.Chart(coil_temp_long).mark_line(strokeWidth=2).encode(
-        x="Time (hours)", y="Temperature (°C)", color="Temperature Type",
-        tooltip=["Time (hours)", "Temperature (°C)"]
-    ).properties(title="Coil Outlet Temperature vs Time", width=750, height=400).interactive()
-    st.altair_chart(chart_coil_temps, use_container_width=True)
-    reset_zoom_button()
 
-elif chart_mode == "Energy":
-    chart_stacked = alt.Chart(df_energy).mark_area(opacity=0.8).encode(
-        x="Time (hours)", y="Cumulative Energy (kWh)", color="Source",
-        tooltip=["Time (hours)", "Source", "Cumulative Energy (kWh)"]
-    ).properties(title="Cumulative Energy from Heat Pump and Coil", width=750, height=400).interactive()
-    st.altair_chart(chart_stacked, use_container_width=True)
-    reset_zoom_button()
+    on_overlay = alt.Chart(df).mark_line(color="#22c55e", strokeWidth=2).encode(
+        x="Time (h)",
+        y=alt.Y("HP_On:Q", title="HP On/Off"),
+        tooltip=["Time (h)", "HP_On"]
+    )
 
-elif chart_mode == "Losses":
-    chart_losses = alt.Chart(df).mark_line(color="brown", strokeWidth=2).encode(
-        x="Time (hours)", y="Losses (W)",
-        tooltip=["Time (hours)", "Losses (W)"]
-    ).properties(title="Tank Losses vs Time", width=750, height=400).interactive()
-    st.altair_chart(chart_losses, use_container_width=True)
-    reset_zoom_button()
+    # IDE-style inline labels
+    mod_label = alt.Chart(pd.DataFrame({"x": [df["Time (h)"].max() * 0.95],
+                                        "y": [0.9],
+                                        "text": ["Modulation Fraction"]})).mark_text(
+        color="#2563eb", align="right", dx=-5, dy=-5, fontSize=12
+    ).encode(x="x", y="y", text="text")
 
-    # --------------------- DATAFRAMES FOR PLOTTING ---------------------
-df = pd.DataFrame({
-    "Time (hours)": time,
-    "Tank Temperature (°C)": T_tank,
-    "HP Power (W)": hp_power_el,
-    "COP": COP_series,
-    "Losses (W)": Q_losses,
-    "Q_from_HP (W)": Q_from_hp,
-    "Q_from_Coil (W)": Q_coil_series,
-    "Coil Outlet Temp (°C)": T_coil_out_series,
-})
-df["Energy_HP (kWh)"] = np.cumsum(Q_from_hp) * (dt_min / 60.0) / 1000.0
-df["Energy_Coil (kWh)"] = np.cumsum(Q_coil_series) * (dt_min / 60.0) / 1000.0
-df_energy = df.melt(id_vars=["Time (hours)"], value_vars=["Energy_HP (kWh)", "Energy_Coil (kWh)"],
-                    var_name="Source", value_name="Cumulative Energy (kWh)")
+    on_label = alt.Chart(pd.DataFrame({"x": [df["Time (h)"].max() * 0.95],
+                                       "y": [1.05],
+                                       "text": ["HP On/Off State"]})).mark_text(
+        color="#22c55e", align="right", dx=-5, dy=5, fontSize=12
+    ).encode(x="x", y="y", text="text")
 
-df_cop = df[["Time (hours)", "COP"]]
-df_temp = df[["Time (hours)", "Tank Temperature (°C)"]]
-df_power = df[["Time (hours)", "HP Power (W)"]]
-df_losses = df[["Time (hours)", "Losses (W)"]]
-df_coil = df[["Time (hours)", "Coil Outlet Temp (°C)", "Q_from_Coil (W)"]]
+    return (
+        base + on_overlay + mod_label + on_label
+    ).properties(
+        height=280,
+        title="Heat Pump Modulation & On/Off State (with Labels)"
+    ).interactive()
 
-    # --------------------- CYLINDER TAPPINGS UPLOAD ---------------------
-st.subheader("🧾 Cylinder Tappings Upload and Visualization")
-uploaded_tappings = st.file_uploader("Upload Cylinder Tappings CSV", type=["csv"])
-df_tappings = None
-if uploaded_tappings:
-    try:
-        df_tappings = pd.read_csv(uploaded_tappings)
-        st.success("✅ Cylinder tapping data loaded successfully.")
-        st.dataframe(df_tappings, use_container_width=True)
-        height_col = next(c for c in df_tappings.columns if "height" in c.lower())
-        temp_col = next(c for c in df_tappings.columns if "temp" in c.lower())
-        chart_tappings = alt.Chart(df_tappings).mark_point(color="blue").encode(
-            x=alt.X(f"{temp_col}:Q", title="Temperature (°C)"),
-            y=alt.Y(f"{height_col}:Q", title="Height (m)")
-        ).properties(title="Measured Cylinder Temperature Profile", width=600, height=400)
-        st.altair_chart(chart_tappings, use_container_width=True)
-    except Exception as e:
-        st.error(f"❌ Error reading file: {e}")
 
-    # --------------------- HELPER: CHART GENERATOR ---------------------
-def generate_chart(key: str):
-    if key == "temperature":
-        base = alt.Chart(df).mark_line(color="red").encode(x="Time (hours)", y="Tank Temperature (°C)")
-        if df_tappings is not None:
-            base += alt.Chart(df_tappings).mark_point(color="blue").encode(
-                x=alt.X("Temperature:Q", title="Temperature (°C)"),
-                y=alt.Y("Height:Q", title="Height (m)")
-            )
-        return base
-    elif key == "cop":
-        return alt.Chart(df_cop).mark_line(color="green").encode(x="Time (hours)", y="COP")
-    elif key == "power":
-        return alt.Chart(df_power).mark_line(color="orange").encode(x="Time (hours)", y="HP Power (W)")
-    elif key == "coil":
-        return alt.Chart(df_coil).mark_line(color="purple").encode(x="Time (hours)", y="Coil Outlet Temp (°C)")
-    elif key == "loss":
-        return alt.Chart(df_losses).mark_line(color="gray").encode(x="Time (hours)", y="Losses (W)")
-    elif key == "energy":
-        return alt.Chart(df_energy).mark_line().encode(x="Time (hours)", y="Cumulative Energy (kWh)", color="Source")
-    return None
 
-# --------------------- GPT-POWERED INTERACTIVE CHATBOT ---------------------
-st.subheader("🤖 Interactive Simulation Copilot")
+def chart_power(df):
+    return alt.Chart(df).mark_line(color="#ef4444").encode(
+        x="Time (h)", y="HP Power (W)"
+    ).properties(height=300, title="Heat Pump Electrical Power (W)")
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "simulation_updates" not in st.session_state:
-    st.session_state.simulation_updates = {}
 
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
+def chart_heat(df):
+    return alt.Chart(df).mark_line(color="#1d4ed8").encode(
+        x="Time (h)", y="HP Heat (W)"
+    ).properties(height=300, title="Heat Pump Heat Output (W)")
 
-client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-system_prompt = f"""
-You are an expert assistant for hot water tank simulations.
-You can explain results, detect patterns, compare measured and simulated data,
-and interpret efficiency behavior from the charts.
-Here is the latest simulation summary:
-{json.dumps(summary, indent=2)}
-"""
+def chart_cop(df):
+    return alt.Chart(df).mark_line(color="green").encode(
+        x="Time (h)", y="COP"
+    ).properties(height=300, title="Coefficient of Performance (COP)")
 
-prompt = st.chat_input("Ask about the simulation or say 'show COP chart'...")
 
-if prompt:
-    st.chat_message("user").markdown(prompt)
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    updates = parse_parameter_change(prompt)
-    if updates:
-        st.session_state.simulation_updates.update(updates)
-        msg = f"Detected parameter change: {updates}. 🔁 Rerunning simulation..."
-        st.chat_message("assistant").markdown(msg)
-        st.session_state.messages.append({"role": "assistant", "content": msg})
-        st.experimental_rerun()
-    elif any(word in prompt.lower() for word in ["chart", "plot", "graph", "show"]):
-        for key in ["temperature", "cop", "power", "coil", "loss", "energy"]:
-            if key in prompt.lower():
-                chart = generate_chart(key)
-                if chart:
-                    st.chat_message("assistant").markdown(f"📊 Here's the **{key.capitalize()}** chart:")
-                    st.altair_chart(chart, use_container_width=True)
-                    explanation = f"I've plotted the {key} data — {('showing both simulated and measured data' if df_tappings is not None else 'based on the simulation results only')}."
-                    st.chat_message("assistant").markdown(explanation)
-                    st.session_state.messages.append({"role": "assistant", "content": explanation})
-                    break
-    elif df_tappings is not None and "compare" in prompt.lower():
-        avg_sim = df_temp["Tank Temperature (°C)"].mean()
-        avg_meas = df_tappings.iloc[:, 1].mean()
-        diff = avg_meas - avg_sim
-        diag = (
-            f"The measured temperatures average {avg_meas:.1f}°C vs simulated {avg_sim:.1f}°C "
-            f"→ difference of {diff:+.1f}°C. "
-            + ("Measured tank is warmer — possible calibration or stratification effect." if diff > 0 else
-               "Measured tank is cooler — could indicate higher losses or draw rates.")
-        )
-        st.chat_message("assistant").markdown("📈 Comparison between measured and simulated data:")
-        st.chat_message("assistant").markdown(diag)
-        st.session_state.messages.append({"role": "assistant", "content": diag})
-    else:
-        messages = [{"role": "system", "content": system_prompt}] + st.session_state.messages
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                response = client.chat.completions.create(
+def chart_tap(df):
+    return alt.Chart(df).mark_bar(color="#f59e0b").encode(
+        x="Time (h)", y="Tap Flow (L/min)"
+    ).properties(height=200, title="Tap Flow (L/min)")
+
+
+# --- Streamlit UI ---
+def main():
+
+    # Sidebar controls
+    st.sidebar.header("Simulation Parameters")
+    Tsrc = st.sidebar.slider("Heat Source Temp (°C)", -5.0, 15.0, 5.0, 0.5)
+    Vtank = st.sidebar.slider("Tank Volume (L)", 100, 500, 300, 10)
+    Utank = st.sidebar.slider("Tank U-value (W/m²K)", 0.1, 2.0, 0.4, 0.1)
+    Tamb = st.sidebar.slider("Ambient Temp (°C)", 0, 30, 15)
+    simh = st.sidebar.slider("Simulation Duration (h)", 1, 48, 24)
+    dtm = st.sidebar.slider("Time Step (min)", 1, 10, 5)
+    setp = st.sidebar.slider("Setpoint (°C)", 40, 60, 50)
+    hyst = st.sidebar.slider("Hysteresis (°C)", 1.0, 10.0, 5.0, 0.5)
+    Pmax = st.sidebar.slider("Max HP Power Ratio", 0.5, 1.0, 1.0, 0.05)
+    Pmin = st.sidebar.slider("Min Modulation Ratio", 0.1, 0.5, 0.2, 0.05)
+    Nlayers = st.sidebar.slider("Number of Tank Layers", 2, 10, 5, 1)
+
+    # Simple tapping schedule
+    raw = [
+        {"Hour": 7, "Minute": 0, "Flow_lpm": 3, "Duration_sec": 45},
+        {"Hour": 7, "Minute": 5, "Flow_lpm": 6, "Duration_sec": 300},
+        {"Hour": 20, "Minute": 30, "Flow_lpm": 4, "Duration_sec": 240},
+        {"Hour": 21, "Minute": 30, "Flow_lpm": 6, "Duration_sec": 300},
+    ]
+    tap = {"time": [], "volume": [], "rate_lpm": []}
+    for e in raw:
+        tmin = e["Hour"] * 60 + e["Minute"]
+        vol = e["Flow_lpm"] * e["Duration_sec"] / 60
+        tap["time"].append(tmin)
+        tap["volume"].append(vol)
+        tap["rate_lpm"].append(e["Flow_lpm"])
+
+    # Run simulation automatically
+    df, summary = run_sim(dtm, simh, Vtank, Utank, Tamb, setp, hyst, Pmin, Pmax, Tsrc, tap, Nlayers)
+
+    # --- Summary ---
+    st.subheader("📊 Simulation Summary")
+    for key, val in summary.items():
+        st.write(f"**{key}:** {val:.2f}" if isinstance(val, float) else f"**{key}:** {val}")
+    st.markdown("---")
+
+    # --- Graph viewer ---
+    st.subheader("📈 Graph Viewer")
+    choice = st.selectbox(
+        "Select a graph:",
+        [
+            "Coefficient of Performance (COP)",
+            "Tank Stratification (Multi-Layer)",
+            "Heat Pump Power (W)",
+            "Heat Pump Heat Output (W)",
+            "HP Modulation & On/Off State",
+            "Tap Flow (L/min)",
+        ],
+    )
+    if choice == "Coefficient of Performance (COP)":
+        st.altair_chart(chart_cop(df), use_container_width=True)
+    elif choice == "Tank Stratification (Multi-Layer)":
+        st.altair_chart(chart_stratification(df), use_container_width=True)
+    elif choice == "Heat Pump Power (W)":
+        st.altair_chart(chart_power(df), use_container_width=True)
+    elif choice == "Heat Pump Heat Output (W)":
+        st.altair_chart(chart_heat(df), use_container_width=True)
+    elif choice == "HP Modulation & On/Off State":
+        st.altair_chart(chart_modulation(df), use_container_width=True)
+    elif choice == "Tap Flow (L/min)":
+        st.altair_chart(chart_tap(df), use_container_width=True)
+
+    # --- AI Assistant ---
+    st.markdown("---")
+    st.subheader("💬 AI Simulation Assistant")
+    st.write("Ask: *Why did stratification change?*, *How to improve COP?*, etc.")
+
+    q = st.text_input("Your question:")
+    if q:
+        if client is None:
+            st.warning("⚠️ OpenAI API key not set.")
+        else:
+            prompt = f"""
+            You are an energy systems expert analyzing a multi-layer stratified tank and modulating heat pump simulation.
+
+            Summary:
+            {summary}
+
+            Columns: {', '.join(df.columns)}
+
+            User question: {q}
+            Provide a concise, technical answer.
+            """
+            with st.spinner("Analyzing..."):
+                r = client.chat.completions.create(
                     model="gpt-4o-mini",
-                    messages=messages,
-                    max_tokens=400,
-                    temperature=0.5
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=300,
                 )
-                reply = response.choices[0].message.content
-                st.markdown(reply)
-        st.session_state.messages.append({"role": "assistant", "content": reply})
+            st.success(r.choices[0].message.content)
+
+
+if __name__ == "__main__":
+    main()
