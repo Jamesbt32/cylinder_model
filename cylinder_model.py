@@ -14,7 +14,7 @@ import base64
 st.set_page_config(page_title="Vaillant Cylinder Model", layout="wide")
 
 # Load and encode your logo
-with open("https://github.com/Jamesbt32/cylinder_model/blob/main/vaillant_logo.png", "rb") as file:
+with open("vaillant_logo.png", "rb") as file:
     data = base64.b64encode(file.read()).decode("utf-8")
 
 # Use an f-string to insert the base64 image data
@@ -385,4 +385,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
