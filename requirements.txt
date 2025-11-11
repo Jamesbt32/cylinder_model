@@ -40,7 +40,7 @@ pydeck==0.9.1
 pyparsing==3.2.4
 python-dateutil==2.9.0.post0
 pytz==2025.2
-pyvista==0.46.3
+pyvista==0.43.6
 PyPDF2==3.0.1
 PyMuPDF==1.24.9
 referencing==0.36.2
@@ -63,5 +63,6 @@ vtk==9.3.0
 watchdog==6.0.0
 websockets==15.0.1
 yfinance==0.2.66
+
 
 
