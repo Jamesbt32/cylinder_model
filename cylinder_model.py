@@ -3,6 +3,9 @@
 # Geometry-aware, with graphs, 3D PyVista viz, and optional AI assistant
 
 import os
+# Force PyVista to run headless on Streamlit Cloud
+os.environ["PYVISTA_OFF_SCREEN"] = "true"
+os.environ["PYVISTA_USE_PANEL"] = "false"
 import base64
 import json
 import streamlit as st
@@ -859,7 +862,7 @@ Do not include any disclaimers about images or external data.
                 st.markdown("### 📷 Relevant Figures from Manual")
 
                 shown = 0  # ✅ initialize counter outside loop
-                
+
                 for idx, it in enumerate(top_items, start=1):
                     imgs = it.get("image_paths", [])
                     for img_path in imgs:
