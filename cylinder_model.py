@@ -12,7 +12,6 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import altair as alt
-import pyvista as pv
 from streamlit_vtkjs import st_vtkjs
 from typing import List, Dict, Tuple, Optional, Any
 from difflib import SequenceMatcher
