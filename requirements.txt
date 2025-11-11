@@ -59,10 +59,10 @@ tqdm==4.66.5
 typing_extensions==4.15.0
 tzdata==2025.2
 urllib3==2.5.0
-vtk==9.3.0
 watchdog==6.0.0
 websockets==15.0.1
 yfinance==0.2.66
+
 
 
 
