@@ -93,13 +93,13 @@ if "layer_properties" not in st.session_state:
     st.session_state.layer_properties = None
 
 def rebuild_knowledge_base():
-    """Extract text + diagrams (raster + rendered pages) from Vaillant PDF and rebuild multimodal FAISS index."""
+    """Extract text + diagrams (raster + rendered pages) from Vaillant  and rebuild multimodal FAISS index."""
     import fitz, faiss
     from openai import OpenAI
 
-    st.info("📘 Reading Vaillant PDF manual...")
+    st.info("📘 Reading Vaillant  manual...")
 
-    pdf_path = r"https://github.com/Jamesbt32/cylinder_model/blob/main/8000014609_03.pdf"
+    pdf_path = r"8000014609_03.pdf"
 
     # --- Open PDF safely ---
     try:
@@ -882,6 +882,7 @@ Do not include any disclaimers about images or external data.
 # --- Entry point ---
 if __name__ == "__main__":
     main()
+
 
 
 
