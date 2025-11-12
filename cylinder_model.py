@@ -94,7 +94,7 @@ if "layer_properties" not in st.session_state:
 
 def rebuild_knowledge_base():
     """Extract text + diagrams (raster + rendered pages) from Vaillant  and rebuild multimodal  index."""
-    import fitz, 
+    import fitz, faiss
     from openai import OpenAI
 
     st.info("📘 Reading Vaillant  manual...")
@@ -882,6 +882,7 @@ Do not include any disclaimers about images or external data.
 # --- Entry point ---
 if __name__ == "__main__":
     main()
+
 
 
 
