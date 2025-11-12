@@ -225,7 +225,7 @@ def rebuild_knowledge_base():
 
     emb_matrix = np.vstack(embeddings)
     faiss.normalize_L2(emb_matrix)
-    index = .IndexFlatIP(emb_matrix.shape[1])
+    index = faiss.IndexFlatIP(emb_matrix.shape[1])
     index.add(emb_matrix)
 
     # --- Save outputs ---
@@ -882,6 +882,7 @@ Do not include any disclaimers about images or external data.
 # --- Entry point ---
 if __name__ == "__main__":
     main()
+
 
 
 
