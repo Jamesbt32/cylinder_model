@@ -3,23 +3,33 @@
 # Geometry-aware, with graphs, 3D PyVista viz, and optional AI assistant
 
 import os
-# Force PyVista to run headless on Streamlit Cloud
-os.environ["PYVISTA_OFF_SCREEN"] = "true"
-os.environ["PYVISTA_USE_PANEL"] = "false"
-import base64
 import json
+import base64
 import streamlit as st
 import numpy as np
 import pandas as pd
 import altair as alt
-from typing import List, Dict, Tuple, Optional, Any
-from difflib import SequenceMatcher
+from typing import List, Dict, Any
 from PyPDF2 import PdfReader
 import fitz
 import faiss
 from openai import OpenAI
-client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
+# --------------------------------------------------------
+# 🔧 Environment setup
+# --------------------------------------------------------
+os.environ["PYVISTA_OFF_SCREEN"] = "true"
+os.environ["PYVISTA_USE_PANEL"] = "false"
+
+# --------------------------------------------------------
+# 🔑 OpenAI client
+# --------------------------------------------------------
+api_key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None)
+client = OpenAI(api_key=api_key) if api_key else None
+
+# --------------------------------------------------------
+# 📂 Load FAISS index + metadata
+# --------------------------------------------------------
 @st.cache_resource
 def load_faiss_index():
     """
@@ -41,20 +51,22 @@ def load_faiss_index():
         st.success("✅ FAISS index loaded successfully.")
         with open(META_PATH, "r", encoding="utf-8") as f:
             meta = json.load(f)
-        st.success(f"✅ Metadata loaded successfully. Found {len(meta)} items.")
+        st.success(f"✅ Metadata loaded successfully. Found {len(meta)} chunks.")
         return index, meta
     except Exception as e:
         st.error(f"❌ Failed to load FAISS index or metadata: {type(e).__name__}: {e}")
         return None, None
 
 
-
-def retrieve__context(query: str, top_k: int = 3):
+# --------------------------------------------------------
+# 🔍 Retrieve relevant manual chunks via FAISS
+# --------------------------------------------------------
+def retrieve_faiss_context(query: str, top_k: int = 3):
     """
-    Retrieve the top_k most relevant manual chunks from the  index
+    Retrieve the top_k most relevant manual chunks from the FAISS index
     given a user query. Uses OpenAI embeddings for similarity search.
     """
-    index,  = load__index()
+    index, meta = load_faiss_index()
     if not index or not meta:
         return []
 
@@ -65,7 +77,6 @@ def retrieve__context(query: str, top_k: int = 3):
 
     try:
         client = OpenAI(api_key=api_key)
-        # Generate embedding for query
         emb_resp = client.embeddings.create(
             model="text-embedding-3-large",
             input=query,
@@ -73,55 +84,48 @@ def retrieve__context(query: str, top_k: int = 3):
         emb_vec = np.array(emb_resp.data[0].embedding, dtype="float32").reshape(1, -1)
         faiss.normalize_L2(emb_vec)
 
-        # Search in  index
         scores, ids = index.search(emb_vec, top_k)
-
         results = []
         for score, idx in zip(scores[0], ids[0]):
-            if 0 <= idx < len():
-                item = [idx]
+            if 0 <= idx < len(meta):
+                item = meta[idx]
                 item["similarity"] = float(score)
                 results.append(item)
-
         return results
 
     except Exception as e:
-        st.warning(f"⚠️ Error retrieving context: {e}")
+        st.warning(f"⚠️ Error retrieving FAISS context: {type(e).__name__}: {e}")
         return []
 
-st.set_page_config(page_title="Vaillant 150 L Cylinder Model", layout="wide")
 
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-if "summary" not in st.session_state:
-    st.session_state.summary = None
-if "layer_properties" not in st.session_state:
-    st.session_state.layer_properties = None
-
+# --------------------------------------------------------
+# 🧱 Rebuild knowledge base from PDF
+# --------------------------------------------------------
 def rebuild_knowledge_base():
-    """Extract text + diagrams (raster + rendered pages) from Vaillant  and rebuild multimodal  index."""
-    import fitz, faiss
-    from openai import OpenAI
+    """
+    Extract text + diagrams from Vaillant manual and rebuild FAISS index.
+    """
+    st.info("📘 Reading Vaillant manual...")
 
-    st.info("📘 Reading Vaillant  manual...")
+    pdf_path = "8000014609_03.pdf"
+    if not os.path.exists(pdf_path):
+        st.error(f"❌ PDF not found at {pdf_path}. Please upload or include it in your repo.")
+        return
 
-    pdf_path = r"8000014609_03.pdf"
-
-    # --- Open PDF safely ---
+    # --- Load PDF ---
     try:
         reader = PdfReader(pdf_path)
         doc = fitz.open(pdf_path)
     except Exception as e:
         st.error(f"❌ Could not open PDF: {e}")
-        return  # must be inside function
+        return
 
-    # --- Containers ---
     items = []
     page_texts = {}
     page_images = {}
 
-    # --- Helper: split text into chunks ---
     def chunk_text(text: str, max_len: int = 700):
+        """Split text into roughly sentence-based chunks."""
         sentences = text.split(". ")
         chunks, cur, cur_len = [], [], 0
         for s in sentences:
@@ -136,62 +140,35 @@ def rebuild_knowledge_base():
 
     # --- Extract text ---
     st.info("📄 Extracting text from manual...")
-    try:
-        pages = list(reader.pages)
-    except Exception:
-        n_pages = getattr(reader, "numPages", 0)
-        pages = [reader.getPage(i) for i in range(int(n_pages))]
-
-    for page_num, page in enumerate(pages, start=1):
+    for page_num, page in enumerate(reader.pages, start=1):
         try:
             text = page.extract_text()
-            if not text or len(text.strip()) < 10:
-                continue
-            page_texts[page_num] = chunk_text(text.strip())
+            if text and len(text.strip()) > 20:
+                page_texts[page_num] = chunk_text(text.strip())
         except Exception as e:
             st.warning(f"⚠️ Could not extract text from page {page_num}: {e}")
 
-    # --- Extract images + render pages ---
-    st.info("🖼️ Extracting diagrams and renders...")
+    # --- Extract images ---
+    st.info("🖼️ Extracting diagrams...")
     for page_num, page in enumerate(doc, start=1):
-        # Extract embedded images
         for img_index, img in enumerate(page.get_images(full=True)):
             try:
                 xref = img[0]
                 base_image = doc.extract_image(xref)
                 image_bytes = base_image["image"]
                 ext = base_image["ext"]
-                width = base_image.get("width", 0)
-                height = base_image.get("height", 0)
-                if width < 150 or height < 150:
-                    continue  # skip small icons
-
-                img_filename = f"page_{page_num}_img_{img_index+1}.{ext}"
+                if base_image.get("width", 0) < 150 or base_image.get("height", 0) < 150:
+                    continue
                 img_dir = os.path.join("kb", "diagrams")
                 os.makedirs(img_dir, exist_ok=True)
+                img_filename = f"page_{page_num}_img_{img_index+1}.{ext}"
                 abs_path = os.path.join(img_dir, img_filename)
                 with open(abs_path, "wb") as f:
                     f.write(image_bytes)
-
                 rel_path = os.path.join("kb", "diagrams", img_filename)
                 page_images.setdefault(page_num, []).append(rel_path)
-
             except Exception as e:
                 st.warning(f"⚠️ Could not extract image on page {page_num}: {e}")
-
-        # Render full page
-        try:
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-            render_filename = f"page_{page_num}_render.png"
-            render_dir = os.path.join("kb", "renders")
-            os.makedirs(render_dir, exist_ok=True)
-            abs_render_path = os.path.join(render_dir, render_filename)
-            pix.save(abs_render_path)
-
-            rel_render = os.path.join("kb", "renders", render_filename)
-            page_images.setdefault(page_num, []).append(rel_render)
-        except Exception as e:
-            st.warning(f"⚠️ Could not render page {page_num}: {e}")
 
     # --- Combine text + images ---
     st.info("🔗 Combining text + images...")
@@ -205,16 +182,14 @@ def rebuild_knowledge_base():
                 "image_paths": imgs
             })
 
-    # --- Create embeddings ---
-    api_key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")
+    # --- Generate embeddings ---
     if not api_key:
-        st.error("⚠️ OPENAI_API_KEY not set.")
+        st.error("⚠️ OPENAI_API_KEY not set — cannot generate embeddings.")
         return
 
-    client = OpenAI(api_key=api_key)
-    embeddings = []
-
     st.info(f"⚙️ Generating embeddings for {len(items)} chunks...")
+    embeddings = []
+    client = OpenAI(api_key=api_key)
     for i, it in enumerate(items, 1):
         try:
             emb_resp = client.embeddings.create(
@@ -224,7 +199,7 @@ def rebuild_knowledge_base():
             emb = np.array(emb_resp.data[0].embedding, dtype="float32")
             embeddings.append(emb)
         except Exception as e:
-            st.warning(f"⚠️ Skipped item {i}: {e}")
+            st.warning(f"⚠️ Skipped chunk {i}: {e}")
             embeddings.append(np.zeros((3072,), dtype="float32"))
         if i % 10 == 0:
             st.write(f"→ Embedded {i}/{len(items)}")
@@ -234,22 +209,20 @@ def rebuild_knowledge_base():
     index = faiss.IndexFlatIP(emb_matrix.shape[1])
     index.add(emb_matrix)
 
-    # --- Save outputs ---
+    # --- Save index + metadata ---
     kb_dir = "kb"
     os.makedirs(kb_dir, exist_ok=True)
-    INDEX_PATH = os.path.join("vaillant_joint_faiss.index")
-    META_PATH = os.path.join("vaillant_joint_meta.json")
+    INDEX_PATH = os.path.join(kb_dir, "vaillant_joint_faiss.index")
+    META_PATH = os.path.join(kb_dir, "vaillant_joint_meta.json")
 
     faiss.write_index(index, INDEX_PATH)
     with open(META_PATH, "w", encoding="utf-8") as f:
         json.dump(items, f, indent=2, ensure_ascii=False)
 
-    num_imgs = sum(len(v) for v in page_images.values())
-    num_pages = len(page_texts)
-    st.success(f"✅ Knowledge base built with {len(items)} chunks from {num_pages} pages and {num_imgs} images.")
+    st.success(f"✅ Knowledge base built with {len(items)} text chunks and {sum(len(v) for v in page_images.values())} images.")
 
-# --- 6️⃣ Then define the rest of your main() function here ---
-def main():
+
+
     st.title("Vaillant 150 L Cylinder Model Simulation")
     # ... rest of your simulation + charts + AI chat code ...
 
@@ -888,6 +861,7 @@ Do not include any disclaimers about images or external data.
 # --- Entry point ---
 if __name__ == "__main__":
     main()
+
 
 
 
