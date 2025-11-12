@@ -245,7 +245,7 @@ def rebuild_knowledge_base():
 
 # --- Logo ---
 try:
-    with open("src/src/vaillant_logo.png", "rb") as file:
+    with open("vaillant_logo.png", "rb") as file:
         data = base64.b64encode(file.read()).decode("utf-8")
 
     st.markdown(
@@ -877,6 +877,7 @@ Do not include any disclaimers about images or external data.
 # --- Entry point ---
 if __name__ == "__main__":
     main()
+
 
 
 
