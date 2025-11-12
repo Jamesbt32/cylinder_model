@@ -29,7 +29,7 @@ def load_faiss_index():
     INDEX_PATH = "kb/vaillant_joint_faiss.index"
     META_PATH = "kb/vaillant_joint_meta.json"
 
-    st.write(f"🔍 Looking for index: {INDEX_PATH}")
+    st.write(f"🔍 Looking for index: {vaillant_joint_faiss.index}")
     st.write(f"🔍 Looking for meta: {META_PATH}")
 
     if not os.path.exists(INDEX_PATH) or not os.path.exists(META_PATH):
@@ -37,7 +37,7 @@ def load_faiss_index():
         return None, None
 
     try:
-        index = faiss.read_index(INDEX_PATH)
+        index = faiss.read_index(vaillant_joint_faiss.index)
         st.success("✅ FAISS index loaded successfully.")
         with open(META_PATH, "r", encoding="utf-8") as f:
             meta = json.load(f)
@@ -887,6 +887,7 @@ Do not include any disclaimers about images or external data.
 # --- Entry point ---
 if __name__ == "__main__":
     main()
+
 
 
 
