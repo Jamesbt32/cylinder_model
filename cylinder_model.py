@@ -36,7 +36,7 @@ def load_faiss_index():
     try:
         index = faiss.read_index(INDEX_PATH)
         with open(_PATH, "r", encoding="utf-8") as f:
-             = json.load(f)
+            meta = json.load(f)
         return index, 
     except Exception as e:
         st.error(f"❌ Failed to load  index or data: {e}")
@@ -882,6 +882,7 @@ Do not include any disclaimers about images or external data.
 # --- Entry point ---
 if __name__ == "__main__":
     main()
+
 
 
 
