@@ -49,7 +49,7 @@ def retrieve__context(query: str, top_k: int = 3):
     given a user query. Uses OpenAI embeddings for similarity search.
     """
     index,  = load__index()
-    if not index or not :
+    if not index or not meta:
         return []
 
     api_key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None)
@@ -882,6 +882,7 @@ Do not include any disclaimers about images or external data.
 # --- Entry point ---
 if __name__ == "__main__":
     main()
+
 
 
 
