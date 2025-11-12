@@ -15,6 +15,17 @@ import fitz
 import faiss
 from openai import OpenAI
 
+st.set_page_config(
+    page_title="Vaillant 150 L Cylinder Model",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# then your app content:
+def main():
+    st.title("Vaillant 150 L Cylinder Model Simulation")
+    st.write("This text now sits next to the sidebar, using the full screen width.")
+
 # --------------------------------------------------------
 # 🔧 Environment setup
 # --------------------------------------------------------
@@ -861,6 +872,7 @@ Do not include any disclaimers about images or external data.
 # --- Entry point ---
 if __name__ == "__main__":
     main()
+
 
 
 
