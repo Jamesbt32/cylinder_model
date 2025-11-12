@@ -99,7 +99,7 @@ def rebuild_knowledge_base():
 
     st.info("📘 Reading Vaillant PDF manual...")
 
-    pdf_path = r"C:\Users\james\OneDrive\Documents\Python\knowledge\8000014609_03.pdf"
+    pdf_path = r"https://github.com/Jamesbt32/cylinder_model/blob/main/8000014609_03.pdf"
 
     # --- Open PDF safely ---
     try:
@@ -882,5 +882,6 @@ Do not include any disclaimers about images or external data.
 # --- Entry point ---
 if __name__ == "__main__":
     main()
+
 
 
