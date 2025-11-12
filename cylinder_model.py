@@ -30,9 +30,9 @@ def load_faiss_index():
     META_PATH = "kb/vaillant_joint_meta.json"
 
     st.write(f"🔍 Looking for index: {vaillant_joint_faiss.index}")
-    st.write(f"🔍 Looking for meta: {META_PATH}")
+    st.write(f"🔍 Looking for meta: {vaillant_joint_meta.json}")
 
-    if not os.path.exists(INDEX_PATH) or not os.path.exists(META_PATH):
+    if not os.path.exists(vaillant_joint_faiss.index) or not os.path.exists(vaillant_joint_meta.json):
         st.warning("⚠️ Knowledge base index not found. Please click **Rebuild Knowledge Base** in the sidebar.")
         return None, None
 
@@ -887,6 +887,7 @@ Do not include any disclaimers about images or external data.
 # --- Entry point ---
 if __name__ == "__main__":
     main()
+
 
 
 
