@@ -26,7 +26,7 @@ def load_faiss_index():
     Load the FAISS index and associated metadata (manual chunks + images).
     Returns (index, metadata) or (None, None) if files are missing.
     """
-    INDEX_PATH = "kb/vaillant_joint_faiss.index"
+    INDEX_PATH = "vaillant_joint_faiss.index"
     META_PATH = "kb/vaillant_joint_meta.json"
 
     if not os.path.exists(INDEX_PATH) or not os.path.exists(META_PATH):
@@ -39,16 +39,16 @@ def load_faiss_index():
             meta = json.load(f)
         return index, meta
     except Exception as e:
-        st.error(f"❌ Failed to load FAISS index or metadata: {e}")
+        st.error(f"❌ Failed to load  index or metadata: {e}")
         return None, None
 
 
-def retrieve_faiss_context(query: str, top_k: int = 3):
+def retrieve__context(query: str, top_k: int = 3):
     """
-    Retrieve the top_k most relevant manual chunks from the FAISS index
+    Retrieve the top_k most relevant manual chunks from the  index
     given a user query. Uses OpenAI embeddings for similarity search.
     """
-    index, meta = load_faiss_index()
+    index, meta = load__index()
     if not index or not meta:
         return []
 
@@ -65,9 +65,9 @@ def retrieve_faiss_context(query: str, top_k: int = 3):
             input=query,
         )
         emb_vec = np.array(emb_resp.data[0].embedding, dtype="float32").reshape(1, -1)
-        faiss.normalize_L2(emb_vec)
+        .normalize_L2(emb_vec)
 
-        # Search in FAISS index
+        # Search in  index
         scores, ids = index.search(emb_vec, top_k)
 
         results = []
@@ -93,8 +93,8 @@ if "layer_properties" not in st.session_state:
     st.session_state.layer_properties = None
 
 def rebuild_knowledge_base():
-    """Extract text + diagrams (raster + rendered pages) from Vaillant  and rebuild multimodal FAISS index."""
-    import fitz, faiss
+    """Extract text + diagrams (raster + rendered pages) from Vaillant  and rebuild multimodal  index."""
+    import fitz, 
     from openai import OpenAI
 
     st.info("📘 Reading Vaillant  manual...")
@@ -224,8 +224,8 @@ def rebuild_knowledge_base():
             st.write(f"→ Embedded {i}/{len(items)}")
 
     emb_matrix = np.vstack(embeddings)
-    faiss.normalize_L2(emb_matrix)
-    index = faiss.IndexFlatIP(emb_matrix.shape[1])
+    .normalize_L2(emb_matrix)
+    index = .IndexFlatIP(emb_matrix.shape[1])
     index.add(emb_matrix)
 
     # --- Save outputs ---
@@ -882,6 +882,7 @@ Do not include any disclaimers about images or external data.
 # --- Entry point ---
 if __name__ == "__main__":
     main()
+
 
 
 
