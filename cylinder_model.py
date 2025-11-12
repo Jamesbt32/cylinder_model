@@ -42,31 +42,34 @@ client = OpenAI(api_key=api_key) if api_key else None
 # 📂 Load FAISS index + metadata
 # --------------------------------------------------------
 @st.cache_resource
+@st.cache_resource
 def load_faiss_index():
+    """
+    Load the FAISS index and associated metadata (manual chunks + images).
+    Returns (index, metadata) or (None, None) if files are missing.
+    """
     INDEX_PATH = "kb/vaillant_joint_faiss.index"
     META_PATH = "kb/vaillant_joint_meta.json"
 
-    with st.sidebar:
-        st.write(f"🔍 Looking for index: {INDEX_PATH}")
-        st.write(f"🔍 Looking for meta: {META_PATH}")
+    print(f"🔍 Looking for index: {INDEX_PATH}")
+    print(f"🔍 Looking for meta: {META_PATH}")
 
     if not os.path.exists(INDEX_PATH) or not os.path.exists(META_PATH):
-        with st.sidebar:
-            st.warning("⚠️ Knowledge base index not found. Please click **Rebuild Knowledge Base**.")
+        print("⚠️ Knowledge base index not found. Please rebuild the KB.")
         return None, None
 
     try:
         index = faiss.read_index(INDEX_PATH)
-        with st.sidebar:
-            st.success("✅ FAISS index loaded successfully.")
+        print("✅ FAISS index loaded successfully.")
+
         with open(META_PATH, "r", encoding="utf-8") as f:
             meta = json.load(f)
-        with st.sidebar:
-            st.success(f"✅ Metadata loaded successfully. Found {len(meta)} chunks.")
+        print(f"✅ Metadata loaded successfully. Found {len(meta)} chunks.")
+
         return index, meta
+
     except Exception as e:
-        with st.sidebar:
-            st.error(f"❌ Failed to load FAISS index or metadata: {type(e).__name__}: {e}")
+        print(f"❌ Failed to load FAISS index or metadata: {type(e).__name__}: {e}")
         return None, None
 
 
@@ -874,6 +877,7 @@ Do not include any disclaimers about images or external data.
 # --- Entry point ---
 if __name__ == "__main__":
     main()
+
 
 
 
