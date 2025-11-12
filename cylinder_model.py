@@ -29,15 +29,15 @@ def load_faiss_index():
     INDEX_PATH = "kb/vaillant_joint_faiss.index"
     META_PATH = "kb/vaillant_joint_meta.json"
 
-    st.write(f"🔍 Looking for index: {vaillant_joint_faiss.index}")
-    st.write(f"🔍 Looking for meta: {vaillant_joint_meta.json}")
+    st.write(f"🔍 Looking for index: {INDEX_PATH}")
+    st.write(f"🔍 Looking for meta: {META_PATH}")
 
-    if not os.path.exists(vaillant_joint_faiss.index) or not os.path.exists(vaillant_joint_meta.json):
+    if not os.path.exists(INDEX_PATH) or not os.path.exists(META_PATH):
         st.warning("⚠️ Knowledge base index not found. Please click **Rebuild Knowledge Base** in the sidebar.")
         return None, None
 
     try:
-        index = faiss.read_index(vaillant_joint_faiss.index)
+        index = faiss.read_index(INDEX_PATH)
         st.success("✅ FAISS index loaded successfully.")
         with open(META_PATH, "r", encoding="utf-8") as f:
             meta = json.load(f)
@@ -46,6 +46,7 @@ def load_faiss_index():
     except Exception as e:
         st.error(f"❌ Failed to load FAISS index or metadata: {type(e).__name__}: {e}")
         return None, None
+
 
 
 def retrieve__context(query: str, top_k: int = 3):
@@ -887,6 +888,7 @@ Do not include any disclaimers about images or external data.
 # --- Entry point ---
 if __name__ == "__main__":
     main()
+
 
 
 
