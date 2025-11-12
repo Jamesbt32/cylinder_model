@@ -65,7 +65,7 @@ def retrieve__context(query: str, top_k: int = 3):
             input=query,
         )
         emb_vec = np.array(emb_resp.data[0].embedding, dtype="float32").reshape(1, -1)
-        .normalize_L2(emb_vec)
+        faiss.normalize_L2(emb_vec)
 
         # Search in  index
         scores, ids = index.search(emb_vec, top_k)
@@ -882,6 +882,7 @@ Do not include any disclaimers about images or external data.
 # --- Entry point ---
 if __name__ == "__main__":
     main()
+
 
 
 
