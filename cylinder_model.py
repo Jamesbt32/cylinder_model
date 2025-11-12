@@ -17,6 +17,8 @@ from difflib import SequenceMatcher
 from PyPDF2 import PdfReader
 import fitz
 import faiss
+from openai import OpenAI
+client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 @st.cache_resource
 def load_faiss_index():
