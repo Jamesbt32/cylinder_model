@@ -26,8 +26,11 @@ def load_faiss_index():
     Load the FAISS index and associated metadata (manual chunks + images).
     Returns (index, metadata) or (None, None) if files are missing.
     """
-    INDEX_PATH = "vaillant_joint_faiss.index"
-    META_PATH = "vaillant_joint_meta.json"
+    INDEX_PATH = "kb/vaillant_joint_faiss.index"
+    META_PATH = "kb/vaillant_joint_meta.json"
+
+    st.write(f"🔍 Looking for index: {INDEX_PATH}")
+    st.write(f"🔍 Looking for meta: {META_PATH}")
 
     if not os.path.exists(INDEX_PATH) or not os.path.exists(META_PATH):
         st.warning("⚠️ Knowledge base index not found. Please click **Rebuild Knowledge Base** in the sidebar.")
@@ -35,11 +38,13 @@ def load_faiss_index():
 
     try:
         index = faiss.read_index(INDEX_PATH)
+        st.success("✅ FAISS index loaded successfully.")
         with open(META_PATH, "r", encoding="utf-8") as f:
             meta = json.load(f)
-        return index, 
+        st.success(f"✅ Metadata loaded successfully. Found {len(meta)} items.")
+        return index, meta
     except Exception as e:
-        st.error(f"❌ Failed to load  index or data: {e}")
+        st.error(f"❌ Failed to load FAISS index or metadata: {type(e).__name__}: {e}")
         return None, None
 
 
@@ -882,6 +887,7 @@ Do not include any disclaimers about images or external data.
 # --- Entry point ---
 if __name__ == "__main__":
     main()
+
 
 
 
