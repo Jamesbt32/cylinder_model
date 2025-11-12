@@ -27,7 +27,7 @@ def load_faiss_index():
     Returns (index, metadata) or (None, None) if files are missing.
     """
     INDEX_PATH = "vaillant_joint_faiss.index"
-    META_PATH = "kb/vaillant_joint_meta.json"
+    META_PATH = "vaillant_joint_meta.json"
 
     if not os.path.exists(INDEX_PATH) or not os.path.exists(META_PATH):
         st.warning("⚠️ Knowledge base index not found. Please click **Rebuild Knowledge Base** in the sidebar.")
@@ -35,11 +35,11 @@ def load_faiss_index():
 
     try:
         index = faiss.read_index(INDEX_PATH)
-        with open(META_PATH, "r", encoding="utf-8") as f:
-            meta = json.load(f)
-        return index, meta
+        with open(_PATH, "r", encoding="utf-8") as f:
+             = json.load(f)
+        return index, 
     except Exception as e:
-        st.error(f"❌ Failed to load  index or metadata: {e}")
+        st.error(f"❌ Failed to load  index or data: {e}")
         return None, None
 
 
@@ -48,8 +48,8 @@ def retrieve__context(query: str, top_k: int = 3):
     Retrieve the top_k most relevant manual chunks from the  index
     given a user query. Uses OpenAI embeddings for similarity search.
     """
-    index, meta = load__index()
-    if not index or not meta:
+    index,  = load__index()
+    if not index or not :
         return []
 
     api_key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None)
@@ -72,8 +72,8 @@ def retrieve__context(query: str, top_k: int = 3):
 
         results = []
         for score, idx in zip(scores[0], ids[0]):
-            if 0 <= idx < len(meta):
-                item = meta[idx]
+            if 0 <= idx < len():
+                item = [idx]
                 item["similarity"] = float(score)
                 results.append(item)
 
@@ -231,8 +231,8 @@ def rebuild_knowledge_base():
     # --- Save outputs ---
     kb_dir = "kb"
     os.makedirs(kb_dir, exist_ok=True)
-    INDEX_PATH = os.path.join(kb_dir, "vaillant_joint_faiss.index")
-    META_PATH = os.path.join(kb_dir, "vaillant_joint_meta.json")
+    INDEX_PATH = os.path.join("vaillant_joint_faiss.index")
+    META_PATH = os.path.join("vaillant_joint_meta.json")
 
     faiss.write_index(index, INDEX_PATH)
     with open(META_PATH, "w", encoding="utf-8") as f:
@@ -882,6 +882,7 @@ Do not include any disclaimers about images or external data.
 # --- Entry point ---
 if __name__ == "__main__":
     main()
+
 
 
 
