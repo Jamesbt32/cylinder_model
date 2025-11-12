@@ -224,7 +224,7 @@ def rebuild_knowledge_base():
             st.write(f"→ Embedded {i}/{len(items)}")
 
     emb_matrix = np.vstack(embeddings)
-    .normalize_L2(emb_matrix)
+    faiss.normalize_L2(emb_matrix)
     index = .IndexFlatIP(emb_matrix.shape[1])
     index.add(emb_matrix)
 
@@ -882,6 +882,7 @@ Do not include any disclaimers about images or external data.
 # --- Entry point ---
 if __name__ == "__main__":
     main()
+
 
 
 
