@@ -626,7 +626,7 @@ def main():
 
         # --- Heat Pump Control ---
         st.markdown("### Heat Pump Control")
-        setp = st.slider("Setpoint (°C)", 40, 60, 50, 70, 80, 90, key="param_setp")
+        setp = st.slider("Setpoint (°C)", 40, 90, 50, 1, key="param_setp")
         hyst = st.slider("Hysteresis (°C)", 1.0, 10.0, 5.0, 0.5, key="param_hyst")
         Pmax = st.slider("Max HP Power Ratio", 0.5, 1.0, 1.0, 0.05, key="param_pmax")
         Pmin = st.slider("Min Modulation Ratio", 0.1, 0.5, 0.2, 0.05, key="param_pmin")
