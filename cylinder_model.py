@@ -14,6 +14,7 @@ from PyPDF2 import PdfReader
 import fitz
 import faiss
 from openai import OpenAI
+from difflib import SequenceMatcher
 
 st.set_page_config(
     page_title="Vaillant 150 L Cylinder Model",
@@ -625,7 +626,7 @@ def main():
 
         # --- Heat Pump Control ---
         st.markdown("### Heat Pump Control")
-        setp = st.slider("Setpoint (°C)", 40, 60, 50, key="param_setp")
+        setp = st.slider("Setpoint (°C)", 40, 60, 50, 70, 80, 90, key="param_setp")
         hyst = st.slider("Hysteresis (°C)", 1.0, 10.0, 5.0, 0.5, key="param_hyst")
         Pmax = st.slider("Max HP Power Ratio", 0.5, 1.0, 1.0, 0.05, key="param_pmax")
         Pmin = st.slider("Min Modulation Ratio", 0.1, 0.5, 0.2, 0.05, key="param_pmin")
@@ -877,7 +878,6 @@ Do not include any disclaimers about images or external data.
 # --- Entry point ---
 if __name__ == "__main__":
     main()
-
 
 
 
