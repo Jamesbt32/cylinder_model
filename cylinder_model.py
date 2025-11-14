@@ -61,6 +61,7 @@ def train_feedback_model(df: pd.DataFrame):
     joblib.dump(model, MODEL_FILE)
     return vec, model
 
+@st.cache_data(ttl=60)  # Cache for 60 seconds to balance freshness and speed
 def load_feedback_data():
     if os.path.exists(FEEDBACK_FILE):
         return pd.read_csv(FEEDBACK_FILE)
@@ -114,19 +115,16 @@ def load_faiss_index():
         if os.path.exists(idx_path) and os.path.exists(meta_path):
             INDEX_PATH = idx_path
             META_PATH = meta_path
-            st.success(f"✅ Found knowledge base at: {os.path.dirname(idx_path)}")
             break
     
     if not INDEX_PATH or not META_PATH:
         st.warning("⚠️ Knowledge base not found. Please rebuild it using the sidebar button.")
-        st.info(f"Looking for files in:\n- {possible_paths[0][0]}\n- {possible_paths[1][0]}\n- {possible_paths[2][0]}")
         return None, None
 
     try:
         index = faiss.read_index(INDEX_PATH)
         with open(META_PATH, "r", encoding="utf-8") as f:
             meta = json.load(f)
-        st.success(f"✅ Loaded {len(meta)} chunks from knowledge base")
         return index, meta
     except Exception as e:
         st.error(f"❌ Failed to load FAISS: {e}")
@@ -1147,7 +1145,17 @@ def main():
         # -----------------------------------------------------
         # 💬 Learning Chatbot Integration with Spinner & Typewriter
         # -----------------------------------------------------
-        if query:
+        
+        # Initialize session state for storing responses
+        if 'chatbot_response' not in st.session_state:
+            st.session_state['chatbot_response'] = None
+        if 'chatbot_query' not in st.session_state:
+            st.session_state['chatbot_query'] = None
+        if 'retrieved_items' not in st.session_state:
+            st.session_state['retrieved_items'] = []
+        
+        # Only run chatbot if query changed
+        if query and query != st.session_state['chatbot_query']:
             api_key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")
             if not api_key:
                 st.warning("⚠️ Please set your OpenAI API key.")
@@ -1206,98 +1214,119 @@ Please provide a detailed, technical answer based on the information provided ab
                             st.error(f"OpenAI error: {e}")
                             break
 
-                if responses:
-                    # === Load or train ML feedback model ===
-                    feedback_df = load_feedback_data()
-                    if os.path.exists(MODEL_FILE) and os.path.exists(VEC_FILE):
-                        vec = joblib.load(VEC_FILE)
-                        model = joblib.load(MODEL_FILE)
-                    else:
-                        vec, model = train_feedback_model(feedback_df)
+                    if responses:
+                        # === Load or train ML feedback model ===
+                        feedback_df = load_feedback_data()
+                        if os.path.exists(MODEL_FILE) and os.path.exists(VEC_FILE):
+                            vec = joblib.load(VEC_FILE)
+                            model = joblib.load(MODEL_FILE)
+                        else:
+                            vec, model = train_feedback_model(feedback_df)
 
-                    # === Rank responses ===
-                    if model and vec:
-                        Xtest = [query + " " + r for r in responses]
-                        probs = model.predict_proba(vec.transform(Xtest))[:, 1]
-                        best_idx = int(np.argmax(probs))
-                        st.caption(f"🧠 ML model ranked responses (confidence {probs[best_idx]:.2f})")
-                    else:
-                        best_idx = 0
-                        st.caption("⚙️ No trained model yet — showing first GPT answer")
+                        # === Rank responses ===
+                        if model and vec:
+                            Xtest = [query + " " + r for r in responses]
+                            probs = model.predict_proba(vec.transform(Xtest))[:, 1]
+                            best_idx = int(np.argmax(probs))
+                        else:
+                            best_idx = 0
 
-                    best_response = responses[best_idx]
-
-                    # === Show final answer with typewriter effect ===
-                    st.markdown("### 💬 Chatbot Response")
-                    typewriter_effect(best_response, speed=0.01)
-                    
-                    # === Display retrieved images if using manual data ===
-                    pages_with_images = []
-                    if data_mode.startswith("Manual") and retrieved_items:
-                        st.markdown("---")
-                        st.markdown("### 📷 Related Diagrams from Manual")
+                        best_response = responses[best_idx]
                         
-                        for idx, item in enumerate(retrieved_items, 1):
-                            if item.get('image_paths'):
-                                page_num = item.get('page', '?')
-                                pages_with_images.append(page_num)
-                                
-                                st.markdown(f"#### 📄 Page {page_num}")
-                                for img_path in item.get('image_paths', []):
-                                    if os.path.exists(img_path):
-                                        st.image(img_path, caption=f"Page {page_num}", use_column_width=True)
-                                    else:
-                                        st.warning(f"Image not found: {img_path}")
-                                
-                                # Feedback for this specific page
-                                st.markdown(f"**Was Page {page_num} helpful for your question?**")
-                                feedback_page = st.radio(
-                                    f"Page {page_num} helpfulness:",
-                                    ["👍 Yes", "👎 No"],
-                                    horizontal=True,
-                                    key=f"feedback_page_{page_num}_{query}"
-                                )
-                                if st.button(f"💾 Save Feedback for Page {page_num}", key=f"save_page_{page_num}_{query}"):
-                                    with st.spinner("💾 Saving feedback..."):
-                                        new_row = {
-                                            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                            "question": f"{query} (Page {page_num})",
-                                            "response": f"Page {page_num} content",
-                                            "helpful": feedback_page
-                                        }
-                                        feedback_df = pd.concat([feedback_df, pd.DataFrame([new_row])], ignore_index=True)
-                                        feedback_df.to_csv(FEEDBACK_FILE, index=False)
-                                        time.sleep(0.5)
-                                    st.success(f"✅ Feedback saved for Page {page_num}!")
-                                
-                                st.markdown("---")
-                    
-                    # === General feedback if no images or after all image feedback ===
-                    st.markdown("### 📝 Overall Response Feedback")
-                    feedback = st.radio(
-                        "Was this overall answer helpful?",
-                        ["👍 Yes", "👎 No"],
-                        horizontal=True,
-                        key=f"feedback_overall_{query}"
-                    )
-                    if st.button("💾 Save Overall Feedback", key=f"save_overall_{query}"):
-                        with st.spinner("💾 Saving feedback..."):
-                            new_row = {
-                                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                "question": query,
-                                "response": best_response,
-                                "helpful": feedback
-                            }
-                            feedback_df = pd.concat([feedback_df, pd.DataFrame([new_row])], ignore_index=True)
-                            feedback_df.to_csv(FEEDBACK_FILE, index=False)
-                            time.sleep(0.5)
-                        st.success("✅ Feedback saved!")
+                        # Store in session state
+                        st.session_state['chatbot_response'] = best_response
+                        st.session_state['chatbot_query'] = query
+                        st.session_state['retrieved_items'] = retrieved_items
+        
+        # Display stored response if available
+        if st.session_state['chatbot_response'] and query:
+            best_response = st.session_state['chatbot_response']
+            retrieved_items = st.session_state['retrieved_items']
+            
+            # === Show final answer with typewriter effect (only on first display) ===
+            st.markdown("### 💬 Chatbot Response")
+            if query != st.session_state.get('last_displayed_query'):
+                typewriter_effect(best_response, speed=0.01)
+                st.session_state['last_displayed_query'] = query
+            else:
+                st.markdown(best_response)
+            
+            # === Display retrieved images if using manual data ===
+            pages_with_images = []
+            if data_mode.startswith("Manual") and retrieved_items:
+                st.markdown("---")
+                st.markdown("### 📷 Related Diagrams from Manual")
+                
+                for idx, item in enumerate(retrieved_items, 1):
+                    if item.get('image_paths'):
+                        page_num = item.get('page', '?')
+                        pages_with_images.append(page_num)
+                        
+                        st.markdown(f"#### 📄 Page {page_num}")
+                        for img_path in item.get('image_paths', []):
+                            if os.path.exists(img_path):
+                                st.image(img_path, caption=f"Page {page_num}", use_column_width=True)
+                            else:
+                                st.warning(f"Image not found: {img_path}")
+                        
+                        # Feedback for this specific page using form for faster submission
+                        with st.form(key=f"form_page_{page_num}_{hash(query)}"):
+                            st.markdown(f"**Was Page {page_num} helpful for your question?**")
+                            feedback_page = st.radio(
+                                f"Page {page_num} helpfulness:",
+                                ["👍 Yes", "👎 No"],
+                                horizontal=True,
+                                key=f"radio_page_{page_num}_{hash(query)}"
+                            )
+                            submitted_page = st.form_submit_button(f"💾 Save Feedback for Page {page_num}")
+                            
+                            if submitted_page:
+                                # Clear cache to get fresh data
+                                load_feedback_data.clear()
+                                feedback_df = load_feedback_data()
+                                new_row = {
+                                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                    "question": f"{query} (Page {page_num})",
+                                    "response": f"Page {page_num} content",
+                                    "helpful": feedback_page
+                                }
+                                feedback_df = pd.concat([feedback_df, pd.DataFrame([new_row])], ignore_index=True)
+                                feedback_df.to_csv(FEEDBACK_FILE, index=False)
+                                load_feedback_data.clear()  # Clear again after save
+                                st.success(f"✅ Feedback saved for Page {page_num}!")
+                        
+                        st.markdown("---")
+            
+            # === General feedback using form for faster submission ===
+            with st.form(key=f"form_overall_{hash(query)}"):
+                st.markdown("### 📝 Overall Response Feedback")
+                feedback = st.radio(
+                    "Was this overall answer helpful?",
+                    ["👍 Yes", "👎 No"],
+                    horizontal=True,
+                    key=f"radio_overall_{hash(query)}"
+                )
+                submitted_overall = st.form_submit_button("💾 Save Overall Feedback")
+                
+                if submitted_overall:
+                    # Clear cache to get fresh data
+                    load_feedback_data.clear()
+                    feedback_df = load_feedback_data()
+                    new_row = {
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "question": query,
+                        "response": best_response,
+                        "helpful": feedback
+                    }
+                    feedback_df = pd.concat([feedback_df, pd.DataFrame([new_row])], ignore_index=True)
+                    feedback_df.to_csv(FEEDBACK_FILE, index=False)
+                    load_feedback_data.clear()  # Clear again after save
+                    st.success("✅ Feedback saved!")
 
-                        # Retrain if threshold met
-                        if len(feedback_df) % RETRAIN_THRESHOLD == 0:
-                            with st.spinner("🔄 Retraining ML model..."):
-                                vec, model = train_feedback_model(feedback_df)
-                            st.success("🎯 Model retrained with latest feedback!")
+                    # Retrain if threshold met
+                    if len(feedback_df) % RETRAIN_THRESHOLD == 0:
+                        vec, model = train_feedback_model(feedback_df)
+                        st.success("🎯 Model retrained with latest feedback!")
 
                     # === Dashboard ===
                     with st.expander("📊 Feedback Dashboard", expanded=False):
