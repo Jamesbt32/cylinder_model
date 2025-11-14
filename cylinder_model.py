@@ -135,58 +135,65 @@ def load_faiss_index():
 # --------------------------------------------------------
 # 🔍 Retrieve relevant manual chunks via FAISS
 # --------------------------------------------------------
-def retrieve_faiss_context(query: str, top_k: int = 3):
+def retrieve_faiss_context(query: str, top_k: int = 3, show_debug: bool = False):
     """
     Retrieve the top_k most relevant manual chunks from the FAISS index
     given a user query. Uses OpenAI embeddings for similarity search.
+    
+    Args:
+        query: The search query
+        top_k: Number of results to return
+        show_debug: If True, display debug information (for testing only)
     """
     index, meta = load_faiss_index()
     if not index or not meta:
-        st.warning("⚠️ FAISS index not loaded. Cannot retrieve manual context.")
+        if show_debug:
+            st.warning("⚠️ FAISS index not loaded. Cannot retrieve manual context.")
         return []
 
     api_key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None)
     if not api_key:
-        st.error("⚠️ Missing OPENAI_API_KEY")
+        if show_debug:
+            st.error("⚠️ Missing OPENAI_API_KEY")
         return []
 
     try:
         client = OpenAI(api_key=api_key)
         
-        with st.spinner("🔍 Searching knowledge base..."):
-            emb_resp = client.embeddings.create(
-                model="text-embedding-3-large",
-                input=query,
-            )
-            emb_vec = np.array(emb_resp.data[0].embedding, dtype="float32").reshape(1, -1)
-            faiss.normalize_L2(emb_vec)
+        emb_resp = client.embeddings.create(
+            model="text-embedding-3-large",
+            input=query,
+        )
+        emb_vec = np.array(emb_resp.data[0].embedding, dtype="float32").reshape(1, -1)
+        faiss.normalize_L2(emb_vec)
 
-            scores, ids = index.search(emb_vec, top_k)
-            results = []
-            for score, idx in zip(scores[0], ids[0]):
-                if 0 <= idx < len(meta):
-                    item = meta[idx]
-                    item["similarity"] = float(score)
-                    results.append(item)
-                    
-            # Display what was found
-            if results:
-                st.success(f"✅ Found {len(results)} relevant manual sections")
-                with st.expander("📖 Retrieved Context (click to view)", expanded=False):
-                    for i, item in enumerate(results, 1):
-                        st.write(f"**Chunk {i}** (Page {item.get('page', '?')}, Similarity: {item.get('similarity', 0):.3f})")
-                        st.write(item.get('text', '')[:200] + "...")
-                        if item.get('image_paths'):
-                            st.write(f"  📷 {len(item.get('image_paths', []))} images available")
-            else:
-                st.warning("⚠️ No relevant context found in knowledge base")
+        scores, ids = index.search(emb_vec, top_k)
+        results = []
+        for score, idx in zip(scores[0], ids[0]):
+            if 0 <= idx < len(meta):
+                item = meta[idx]
+                item["similarity"] = float(score)
+                results.append(item)
                 
-            return results
+        # Only display debug info if explicitly requested
+        if show_debug and results:
+            st.success(f"✅ Found {len(results)} relevant manual sections")
+            with st.expander("📖 Retrieved Context (click to view)", expanded=False):
+                for i, item in enumerate(results, 1):
+                    st.write(f"**Chunk {i}** (Page {item.get('page', '?')}, Similarity: {item.get('similarity', 0):.3f})")
+                    st.write(item.get('text', '')[:200] + "...")
+                    if item.get('image_paths'):
+                        st.write(f"  📷 {len(item.get('image_paths', []))} images available")
+        elif show_debug and not results:
+            st.warning("⚠️ No relevant context found in knowledge base")
+            
+        return results
 
     except Exception as e:
-        st.error(f"⚠️ Error retrieving FAISS context: {e}")
-        import traceback
-        st.code(traceback.format_exc())
+        if show_debug:
+            st.error(f"⚠️ Error retrieving FAISS context: {e}")
+            import traceback
+            st.code(traceback.format_exc())
         return []
 
 def rebuild_knowledge_base():
@@ -861,6 +868,10 @@ def main():
                     st.write(f"- Page: {sample.get('page', 'N/A')}")
                     st.write(f"- Text preview: {sample.get('text', '')[:150]}...")
                     st.write(f"- Images: {len(sample.get('image_paths', []))}")
+                    
+                # Test retrieval with debug output
+                st.markdown("**Test Retrieval:**")
+                test_results = retrieve_faiss_context("heat pump operation", top_k=2, show_debug=True)
             else:
                 st.error("❌ Knowledge base not found or failed to load")
         
@@ -1160,9 +1171,7 @@ def main():
                                     [f"[Manual Page {it.get('page','?')}, Similarity: {it.get('similarity', 0):.3f}]\n{it.get('text','')}" 
                                      for it in top_items]
                                 )
-                                st.info(f"📚 Using {len(top_items)} manual sections for context")
                             else:
-                                st.warning("⚠️ No manual context found - using general knowledge")
                                 kb_context = "No specific manual context found for this query."
 
                         geometry_context = "\n".join(
@@ -1223,27 +1232,55 @@ Please provide a detailed, technical answer based on the information provided ab
                     typewriter_effect(best_response, speed=0.01)
                     
                     # === Display retrieved images if using manual data ===
+                    pages_with_images = []
                     if data_mode.startswith("Manual") and retrieved_items:
                         st.markdown("---")
                         st.markdown("### 📷 Related Diagrams from Manual")
                         
                         for idx, item in enumerate(retrieved_items, 1):
                             if item.get('image_paths'):
-                                with st.expander(f"📄 Page {item.get('page', '?')} Diagrams", expanded=False):
-                                    for img_path in item.get('image_paths', []):
-                                        if os.path.exists(img_path):
-                                            st.image(img_path, caption=f"Page {item.get('page', '?')}", use_column_width=True)
-                                        else:
-                                            st.warning(f"Image not found: {img_path}")
-
-                    # === Feedback section ===
+                                page_num = item.get('page', '?')
+                                pages_with_images.append(page_num)
+                                
+                                st.markdown(f"#### 📄 Page {page_num}")
+                                for img_path in item.get('image_paths', []):
+                                    if os.path.exists(img_path):
+                                        st.image(img_path, caption=f"Page {page_num}", use_column_width=True)
+                                    else:
+                                        st.warning(f"Image not found: {img_path}")
+                                
+                                # Feedback for this specific page
+                                st.markdown(f"**Was Page {page_num} helpful for your question?**")
+                                feedback_page = st.radio(
+                                    f"Page {page_num} helpfulness:",
+                                    ["👍 Yes", "👎 No"],
+                                    horizontal=True,
+                                    key=f"feedback_page_{page_num}_{query}"
+                                )
+                                if st.button(f"💾 Save Feedback for Page {page_num}", key=f"save_page_{page_num}_{query}"):
+                                    with st.spinner("💾 Saving feedback..."):
+                                        new_row = {
+                                            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                            "question": f"{query} (Page {page_num})",
+                                            "response": f"Page {page_num} content",
+                                            "helpful": feedback_page
+                                        }
+                                        feedback_df = pd.concat([feedback_df, pd.DataFrame([new_row])], ignore_index=True)
+                                        feedback_df.to_csv(FEEDBACK_FILE, index=False)
+                                        time.sleep(0.5)
+                                    st.success(f"✅ Feedback saved for Page {page_num}!")
+                                
+                                st.markdown("---")
+                    
+                    # === General feedback if no images or after all image feedback ===
+                    st.markdown("### 📝 Overall Response Feedback")
                     feedback = st.radio(
-                        "Was this answer helpful?",
+                        "Was this overall answer helpful?",
                         ["👍 Yes", "👎 No"],
                         horizontal=True,
-                        key=f"feedback_{query}"
+                        key=f"feedback_overall_{query}"
                     )
-                    if st.button("💾 Save Feedback", key=f"save_{query}"):
+                    if st.button("💾 Save Overall Feedback", key=f"save_overall_{query}"):
                         with st.spinner("💾 Saving feedback..."):
                             new_row = {
                                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1253,7 +1290,7 @@ Please provide a detailed, technical answer based on the information provided ab
                             }
                             feedback_df = pd.concat([feedback_df, pd.DataFrame([new_row])], ignore_index=True)
                             feedback_df.to_csv(FEEDBACK_FILE, index=False)
-                            time.sleep(0.5)  # Brief pause for visual feedback
+                            time.sleep(0.5)
                         st.success("✅ Feedback saved!")
 
                         # Retrain if threshold met
