@@ -93,19 +93,43 @@ def load_faiss_index():
     Load the FAISS index and associated metadata (manual chunks + images).
     Returns (index, metadata) or (None, None) if files are missing.
     """
-    INDEX_PATH = r"C:\Users\james\OneDrive\Documents\Python\kb\vaillant_joint_faiss.index"
-    META_PATH = r"C:\Users\james\OneDrive\Documents\Python\kb\vaillant_joint_meta.json"
-
-    if not os.path.exists(INDEX_PATH) or not os.path.exists(META_PATH):
+    # Try multiple possible paths
+    possible_paths = [
+        # Absolute path (original)
+        (r"C:\Users\james\OneDrive\Documents\Python\kb\vaillant_joint_faiss.index",
+         r"C:\Users\james\OneDrive\Documents\Python\kb\vaillant_joint_meta.json"),
+        # Relative to script
+        (os.path.join(os.path.dirname(__file__), "kb", "vaillant_joint_faiss.index"),
+         os.path.join(os.path.dirname(__file__), "kb", "vaillant_joint_meta.json")),
+        # Current directory
+        (os.path.join("kb", "vaillant_joint_faiss.index"),
+         os.path.join("kb", "vaillant_joint_meta.json")),
+    ]
+    
+    INDEX_PATH = None
+    META_PATH = None
+    
+    # Find first existing path
+    for idx_path, meta_path in possible_paths:
+        if os.path.exists(idx_path) and os.path.exists(meta_path):
+            INDEX_PATH = idx_path
+            META_PATH = meta_path
+            st.success(f"✅ Found knowledge base at: {os.path.dirname(idx_path)}")
+            break
+    
+    if not INDEX_PATH or not META_PATH:
+        st.warning("⚠️ Knowledge base not found. Please rebuild it using the sidebar button.")
+        st.info(f"Looking for files in:\n- {possible_paths[0][0]}\n- {possible_paths[1][0]}\n- {possible_paths[2][0]}")
         return None, None
 
     try:
         index = faiss.read_index(INDEX_PATH)
         with open(META_PATH, "r", encoding="utf-8") as f:
             meta = json.load(f)
+        st.success(f"✅ Loaded {len(meta)} chunks from knowledge base")
         return index, meta
     except Exception as e:
-        st.warning(f"Failed to load FAISS: {e}")
+        st.error(f"❌ Failed to load FAISS: {e}")
         return None, None
 
 # --------------------------------------------------------
@@ -118,6 +142,7 @@ def retrieve_faiss_context(query: str, top_k: int = 3):
     """
     index, meta = load_faiss_index()
     if not index or not meta:
+        st.warning("⚠️ FAISS index not loaded. Cannot retrieve manual context.")
         return []
 
     api_key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None)
@@ -127,24 +152,41 @@ def retrieve_faiss_context(query: str, top_k: int = 3):
 
     try:
         client = OpenAI(api_key=api_key)
-        emb_resp = client.embeddings.create(
-            model="text-embedding-3-large",
-            input=query,
-        )
-        emb_vec = np.array(emb_resp.data[0].embedding, dtype="float32").reshape(1, -1)
-        faiss.normalize_L2(emb_vec)
+        
+        with st.spinner("🔍 Searching knowledge base..."):
+            emb_resp = client.embeddings.create(
+                model="text-embedding-3-large",
+                input=query,
+            )
+            emb_vec = np.array(emb_resp.data[0].embedding, dtype="float32").reshape(1, -1)
+            faiss.normalize_L2(emb_vec)
 
-        scores, ids = index.search(emb_vec, top_k)
-        results = []
-        for score, idx in zip(scores[0], ids[0]):
-            if 0 <= idx < len(meta):
-                item = meta[idx]
-                item["similarity"] = float(score)
-                results.append(item)
-        return results
+            scores, ids = index.search(emb_vec, top_k)
+            results = []
+            for score, idx in zip(scores[0], ids[0]):
+                if 0 <= idx < len(meta):
+                    item = meta[idx]
+                    item["similarity"] = float(score)
+                    results.append(item)
+                    
+            # Display what was found
+            if results:
+                st.success(f"✅ Found {len(results)} relevant manual sections")
+                with st.expander("📖 Retrieved Context (click to view)", expanded=False):
+                    for i, item in enumerate(results, 1):
+                        st.write(f"**Chunk {i}** (Page {item.get('page', '?')}, Similarity: {item.get('similarity', 0):.3f})")
+                        st.write(item.get('text', '')[:200] + "...")
+                        if item.get('image_paths'):
+                            st.write(f"  📷 {len(item.get('image_paths', []))} images available")
+            else:
+                st.warning("⚠️ No relevant context found in knowledge base")
+                
+            return results
 
     except Exception as e:
-        st.warning(f"⚠️ Error retrieving FAISS context: {e}")
+        st.error(f"⚠️ Error retrieving FAISS context: {e}")
+        import traceback
+        st.code(traceback.format_exc())
         return []
 
 def rebuild_knowledge_base():
@@ -802,10 +844,32 @@ def main():
 
         st.markdown("---")
         st.markdown("### 📘 Knowledge Base")
+        
+        # Test knowledge base button
+        if st.button("🧪 Test Knowledge Base", key="btn_test_kb"):
+            index, meta = load_faiss_index()
+            if index and meta:
+                st.success(f"✅ Knowledge base is working!")
+                st.write(f"- **Total chunks**: {len(meta)}")
+                st.write(f"- **Index dimension**: {index.d}")
+                st.write(f"- **Total vectors**: {index.ntotal}")
+                
+                # Show a sample chunk
+                if len(meta) > 0:
+                    sample = meta[0]
+                    st.write("**Sample chunk:**")
+                    st.write(f"- Page: {sample.get('page', 'N/A')}")
+                    st.write(f"- Text preview: {sample.get('text', '')[:150]}...")
+                    st.write(f"- Images: {len(sample.get('image_paths', []))}")
+            else:
+                st.error("❌ Knowledge base not found or failed to load")
+        
         if st.button("🔁 Rebuild Knowledge Base (PDF → FAISS)", key="btn_rebuild_kb"):
             with st.spinner("🔄 Rebuilding knowledge base..."):
                 rebuild_knowledge_base()
             st.success("✅ Knowledge base successfully rebuilt!")
+            # Clear the cache to reload
+            st.cache_resource.clear()
 
     # ==============================================================
     # 🚿 Domestic Hot Water Tapping Schedule
@@ -1083,13 +1147,23 @@ def main():
 
                     # === Generate multiple candidate responses ===
                     responses = []
+                    retrieved_items = []  # Store retrieved context
+                    
                     for _ in range(3):
                         kb_context = ""
                         if data_mode.startswith("Manual"):
                             top_items = retrieve_faiss_context(query, top_k=3)
-                            kb_context = "\n\n".join(
-                                [f"[Manual Page {it.get('page','?')}]\n{it.get('text','')}" for it in top_items]
-                            )
+                            retrieved_items = top_items  # Save for display
+                            
+                            if top_items:
+                                kb_context = "\n\n".join(
+                                    [f"[Manual Page {it.get('page','?')}, Similarity: {it.get('similarity', 0):.3f}]\n{it.get('text','')}" 
+                                     for it in top_items]
+                                )
+                                st.info(f"📚 Using {len(top_items)} manual sections for context")
+                            else:
+                                st.warning("⚠️ No manual context found - using general knowledge")
+                                kb_context = "No specific manual context found for this query."
 
                         geometry_context = "\n".join(
                             [f"{n}: Vol={p['Volume_L']:.1f} L" for n, p in layer_properties.items()]
@@ -1110,6 +1184,8 @@ You are an HVAC expert analyzing a Vaillant 150 L stratified cylinder with a mod
 
 ## Question
 {query}
+
+Please provide a detailed, technical answer based on the information provided above.
 """
                         try:
                             r = client_chat.chat.completions.create(
@@ -1145,6 +1221,20 @@ You are an HVAC expert analyzing a Vaillant 150 L stratified cylinder with a mod
                     # === Show final answer with typewriter effect ===
                     st.markdown("### 💬 Chatbot Response")
                     typewriter_effect(best_response, speed=0.01)
+                    
+                    # === Display retrieved images if using manual data ===
+                    if data_mode.startswith("Manual") and retrieved_items:
+                        st.markdown("---")
+                        st.markdown("### 📷 Related Diagrams from Manual")
+                        
+                        for idx, item in enumerate(retrieved_items, 1):
+                            if item.get('image_paths'):
+                                with st.expander(f"📄 Page {item.get('page', '?')} Diagrams", expanded=False):
+                                    for img_path in item.get('image_paths', []):
+                                        if os.path.exists(img_path):
+                                            st.image(img_path, caption=f"Page {item.get('page', '?')}", use_column_width=True)
+                                        else:
+                                            st.warning(f"Image not found: {img_path}")
 
                     # === Feedback section ===
                     feedback = st.radio(
