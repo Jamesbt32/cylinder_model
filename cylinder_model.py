@@ -80,8 +80,8 @@ def load_faiss_index():
     Load the FAISS index and associated metadata (manual chunks + images).
     Returns (index, metadata) or (None, None) if files are missing.
     """
-    INDEX_PATH = "kb/vaillant_joint_faiss.index"
-    META_PATH = "kb/vaillant_joint_meta.json"
+    INDEX_PATH = "vaillant_joint_faiss.index"
+    META_PATH = "vaillant_joint_meta.json"
 
     print(f"🔍 Looking for index: {INDEX_PATH}")
     print(f"🔍 Looking for meta: {META_PATH}")
@@ -944,6 +944,7 @@ You are an HVAC expert analyzing a Vaillant 150 L stratified cylinder with a mod
 # --- Entry point ---
 if __name__ == "__main__":
     main()
+
 
 
 
