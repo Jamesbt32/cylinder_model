@@ -15,12 +15,43 @@ import fitz
 import faiss
 from openai import OpenAI
 from difflib import SequenceMatcher
+import joblib
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from datetime import datetime
 
 st.set_page_config(
     page_title="Vaillant 150 L Cylinder Model",
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# -----------------------------------------------------
+# 🤖 Learning Chatbot Feedback + Retraining
+# -----------------------------------------------------
+FEEDBACK_FILE = "chat_feedback.csv"
+MODEL_FILE = "ml_feedback_model.pkl"
+VEC_FILE = "ml_feedback_vectorizer.pkl"
+RETRAIN_THRESHOLD = 5
+
+def train_feedback_model(df: pd.DataFrame):
+    if len(df) < 5:
+        return None, None
+    X = [f"{q} {r}" for q, r in zip(df["question"], df["response"])]
+    y = (df["helpful"] == "👍 Yes").astype(int)
+    vec = TfidfVectorizer(max_features=3000)
+    Xv = vec.fit_transform(X)
+    model = LogisticRegression(max_iter=1000).fit(Xv, y)
+    joblib.dump(vec, VEC_FILE)
+    joblib.dump(model, MODEL_FILE)
+    return vec, model
+
+def load_feedback_data():
+    if os.path.exists(FEEDBACK_FILE):
+        return pd.read_csv(FEEDBACK_FILE)
+    else:
+        return pd.DataFrame(columns=["timestamp", "question", "response", "helpful"])
+
 
 # then your app content:
 def main():
@@ -762,118 +793,153 @@ def main():
             st.altair_chart(chart_tap(df), use_container_width=True)
 
     # ==============================================================
-    # 💬 AI Simulation Assistant (Pauses on Parameter Change)
-    # ==============================================================
-    if st.session_state.get("ai_paused", False):
-        st.warning("⚙️ Parameters changed — AI assistant paused. Adjust sliders, then click Resume.")
-        if st.button("💬 Resume AI Assistant"):
-            st.session_state["ai_paused"] = False
-            st.experimental_rerun()
+# 💬 AI Simulation Assistant (Self-Learning Chatbot)
+# ==============================================================
+
+st.markdown("---")
+st.subheader("💬 AI Simulation Assistant")
+st.caption("Ask things like: *Why does the COP drop during tapping?* or *Explain stratification losses.*")
+
+# --- User input widgets ---
+query = st.text_input("Your question:", key="user_question")
+
+st.markdown("### 🧭 Data Source")
+data_mode = st.radio(
+    "Choose how the assistant should respond:",
+    ["Manual Data (RAG from Vaillant PDF)", "OpenAI General Knowledge"],
+    index=0,
+    horizontal=True,
+    key="radio_data_mode",
+)
+
+# -----------------------------------------------------
+# 💬 Learning Chatbot Integration
+# -----------------------------------------------------
+if query:
+    api_key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")
+    if not api_key:
+        st.warning("⚠️ Please set your OpenAI API key.")
         st.stop()
 
-    st.markdown("---")
-    st.subheader("💬 AI Simulation Assistant")
-    st.caption("Ask things like: *Why does the COP drop during tapping?* or *Explain stratification losses.*")
+    client = OpenAI(api_key=api_key)
+    layer_properties = st.session_state["layer_properties"]
+    summary = st.session_state["summary"]
 
-    query = st.text_input("Your question:", key="user_question")
+    # === Generate multiple candidate responses ===
+    responses = []
+    for _ in range(3):
+        kb_context = ""
+        if data_mode.startswith("Manual"):
+            top_items = retrieve_faiss_context(query, top_k=3)
+            kb_context = "\n\n".join(
+                [f"[Manual Page {it.get('page','?')}]\n{it.get('text','')}" for it in top_items]
+            )
 
-    st.markdown("### 🧭 Data Source")
-    data_mode = st.radio(
-        "Choose how the assistant should respond:",
-        ["Manual Data (RAG from Vaillant PDF)", "OpenAI General Knowledge"],
-        index=0,
-        horizontal=True,
-        key="radio_data_mode",
-    )
+        geometry_context = "\n".join(
+            [f"{n}: Vol={p['Volume_L']:.1f} L" for n, p in layer_properties.items()]
+        )
+        summary_text = "\n".join([f"{k}: {v}" for k, v in summary.items()])
 
-    if query:
-        api_key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")
-        if not api_key:
-            st.warning("⚠️ Please set your OpenAI API key.")
-        else:
-            client = OpenAI(api_key=api_key)
-            layer_properties = st.session_state["layer_properties"]
-            summary = st.session_state["summary"]
-
-            if data_mode.startswith("Manual"):
-                index, meta = load_faiss_index()
-                if not index or not meta:
-                    st.warning("⚠️ Knowledge base index not found. Click **Rebuild Knowledge Base** in the sidebar.")
-                    st.stop()
-
-                top_items = retrieve_faiss_context(query, top_k=3)
-                kb_context = "\n\n".join([
-                    f"[Manual Page {it.get('page','?')}] (sim={it.get('similarity',0):.2f})\n{it.get('text','')}"
-                    for it in top_items
-                ])
-            else:
-                kb_context = ""
-
-            geometry_context = "\n".join([
-                f"{n}: Vol={p['Volume_L']:.1f} L, Ext.A={p['Water_External_Surface_mm2']:.0f} mm²"
-                for n, p in layer_properties.items()
-            ])
-            summary_text = "\n".join([f"{k}: {v}" for k, v in summary.items()])
-
-            prompt = f"""
+        prompt = f"""
 You are an HVAC expert analyzing a Vaillant 150 L stratified cylinder with a modulating heat pump.
 
 ## Manual Context
 {kb_context}
 
-## Cylinder Geometry
-{geometry_context}
-
 ## Simulation Summary
 {summary_text}
 
+## Geometry
+{geometry_context}
+
 ## Question
 {query}
-
-Answer directly and factually using the manual context first, then simulation results.
-Do not include any disclaimers about images or external data.
 """
+        try:
+            r = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}]
+            )
+            responses.append(r.choices[0].message.content.strip())
+        except Exception as e:
+            st.error(f"OpenAI error: {e}")
+            st.stop()
 
-            with st.spinner("Analyzing manual and simulation data..."):
-                with st.chat_message("assistant"):
-                    placeholder = st.empty()
-                    response = ""
-                    try:
-                        stream = client.chat.completions.create(
-                            model="gpt-4o-mini",
-                            messages=[{"role": "user", "content": prompt}],
-                            stream=True,
-                        )
-                        for chunk in stream:
-                            if chunk.choices and chunk.choices[0].delta.content:
-                                response += chunk.choices[0].delta.content
-                                placeholder.markdown(response + "▌")
-                        placeholder.markdown(response.strip())
-                    except Exception as e:
-                        st.error(f"Error during streaming: {e}")
+    # === Load or train ML feedback model ===
+    feedback_df = load_feedback_data()
+    if os.path.exists(MODEL_FILE) and os.path.exists(VEC_FILE):
+        vec = joblib.load(VEC_FILE)
+        model = joblib.load(MODEL_FILE)
+    else:
+        vec, model = train_feedback_model(feedback_df)
 
-            # --- Show Manual Images ---
-            if data_mode.startswith("Manual") and top_items:
-                st.markdown("---")
-                st.markdown("### 📷 Relevant Figures from Manual")
+    # === Rank responses ===
+    if model and vec:
+        Xtest = [query + " " + r for r in responses]
+        probs = model.predict_proba(vec.transform(Xtest))[:, 1]
+        best_idx = int(np.argmax(probs))
+        st.caption(f"🧠 ML model ranked responses (confidence {probs[best_idx]:.2f})")
+    else:
+        best_idx = 0
+        st.caption("⚙️ No trained model yet — showing first GPT answer")
 
-                shown = 0  # ✅ initialize counter outside loop
+    best_response = responses[best_idx]
 
-                for idx, it in enumerate(top_items, start=1):
-                    imgs = it.get("image_paths", [])
-                    for img_path in imgs:
-                        if os.path.exists(img_path):
-                            caption = it.get("text", "").split("\n")[0][:100]
-                            page_num = it.get("page", "?")
-                            st.image(
-                                img_path,
-                                caption=f"Figure {idx} – Page {page_num}: {caption}",
-                                use_container_width=True,
-                            )
+    # === Show final answer ===
+    st.markdown("### 💬 Chatbot Response")
+    st.write(best_response)
 
-                            shown += 1
-                if shown == 0:
-                    st.info("No images found — check `kb/diagrams` and `kb/renders` folders.")
+    # === Feedback section ===
+    feedback = st.radio(
+        "Was this answer helpful?",
+        ["👍 Yes", "👎 No"],
+        horizontal=True,
+        key=f"feedback_{query}"
+    )
+    if st.button("💾 Save Feedback", key=f"save_{query}"):
+        new_row = {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "question": query,
+            "response": best_response,
+            "helpful": feedback
+        }
+        feedback_df = pd.concat([feedback_df, pd.DataFrame([new_row])], ignore_index=True)
+        feedback_df.to_csv(FEEDBACK_FILE, index=False)
+        st.success("✅ Feedback saved!")
+
+        # Retrain if threshold met
+        if len(feedback_df) % RETRAIN_THRESHOLD == 0:
+            with st.spinner("🔁 Retraining ML model..."):
+                vec, model = train_feedback_model(feedback_df)
+            st.success("🎯 Model retrained with latest feedback!")
+
+    # === Dashboard ===
+    with st.expander("📊 Feedback Dashboard", expanded=False):
+        if feedback_df.empty:
+            st.info("No feedback data yet.")
+        else:
+            total = len(feedback_df)
+            helpful = (feedback_df["helpful"] == "👍 Yes").sum()
+            ratio = helpful / total * 100
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Total", total)
+            c2.metric("Helpful", helpful)
+            c3.metric("Helpful %", f"{ratio:.1f}%")
+
+            feedback_df["date"] = pd.to_datetime(feedback_df["timestamp"]).dt.date
+            daily = (
+                feedback_df.groupby("date")["helpful"]
+                .apply(lambda x: (x == "👍 Yes").mean() * 100)
+                .reset_index(name="Helpful %")
+            )
+            chart = (
+                alt.Chart(daily)
+                .mark_line(point=True)
+                .encode(x="date:T", y="Helpful %:Q")
+                .properties(height=250, title="Helpful Feedback Trend")
+            )
+            st.altair_chart(chart, use_container_width=True)
+            st.dataframe(feedback_df.sort_values("timestamp", ascending=False))
 
 # --- Entry point ---
 if __name__ == "__main__":
