@@ -107,9 +107,9 @@ def load_faiss_index():
 
 
 # --------------------------------------------------------
-# 🔍 Retrieve relevant manual chunks via FAISS
+# 🔍  relevant manual chunks via FAISS
 # --------------------------------------------------------
-def retrieve_faiss_context(query: str, top_k: int = 3):
+def _faiss_context(query: str, top_k: int = 3):
     """
     Retrieve the top_k most relevant manual chunks from the FAISS index
     given a user query. Uses OpenAI embeddings for similarity search.
@@ -831,9 +831,28 @@ if query:
         kb_context = ""
         if data_mode.startswith("Manual"):
             top_items = retrieve_faiss_context(query, top_k=3)
-            kb_context = "\n\n".join(
-                [f"[Manual Page {it.get('page','?')}]\n{it.get('text','')}" for it in top_items]
-            )
+       # --- Retrieve top chunks from FAISS index ---
+top_items = retrieve_faiss_context(query, top_k=3)
+
+# --- Display retrieved chunks (text + images) ---
+if top_items:
+    st.markdown("### 📘 Retrieved Manual Context")
+    for it in top_items:
+        st.markdown(f"**Page {it.get('page','?')}** — similarity: {it.get('similarity',0):.2f}")
+        st.write(it.get("text", "")[:800] + "...")
+        for img_path in it.get("image_paths", []):
+            if os.path.exists(img_path):
+                st.image(img_path, width=250)
+            else:
+                st.caption(f"⚠️ Image not found: {img_path}")
+        st.markdown("---")
+
+        cols = st.columns(len(it.get("image_paths", [])))
+for col, img_path in zip(cols, it.get("image_paths", [])):
+    if os.path.exists(img_path):
+        col.image(img_path, use_column_width=True)
+
+
 
         geometry_context = "\n".join(
             [f"{n}: Vol={p['Volume_L']:.1f} L" for n, p in layer_properties.items()]
@@ -944,6 +963,7 @@ You are an HVAC expert analyzing a Vaillant 150 L stratified cylinder with a mod
 # --- Entry point ---
 if __name__ == "__main__":
     main()
+
 
 
 
