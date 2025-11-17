@@ -387,8 +387,20 @@ def run_sim(
     legionella_duration: float = 30.0,
     legionella_frequency: float = 7.0,
     legionella_start_hour: int = 2,
+    senso_enabled: bool = False,
+    comfort_mode: str = "Comfort",
+    eco_temp: float = 45.0,
+    comfort_temp: float = 55.0,
+    enable_time_program: bool = False,
+    morning_start: int = 6,
+    morning_end: int = 9,
+    evening_start: int = 17,
+    evening_end: int = 22,
+    boost_mode: bool = False,
+    holiday_mode: bool = False,
+    holiday_temp: float = 40.0,
 ):
-    """4-layer stratified tank simulation with optional Legionella cycle."""
+    """4-layer stratified tank simulation with optional Legionella cycle and SensoComfort controls."""
     for key in ["time", "volume", "rate_lpm"]:
         if key not in tap:
             raise ValueError(f"tap dict missing '{key}'")
@@ -429,6 +441,8 @@ def run_sim(
     Tap_temp = np.zeros(steps)
     Mod_frac = np.zeros(steps)
     Legionella_active = np.zeros(steps, bool)
+    Senso_mode = np.zeros(steps, dtype='<U10')  # Store mode as string
+    Senso_setpoint = np.zeros(steps)
 
     T_bottom_init = setp - 15.0
     T_top_init = setp
@@ -447,7 +461,60 @@ def run_sim(
         tnow_hrs = tnow_min / 60.0
 
         # ============================================================
-        # 🦠 LEGIONELLA CYCLE LOGIC
+        # 🎛️ SENSOCOMFORT CONTROL LOGIC
+        # ============================================================
+        active_setpoint = setp
+        current_mode = "Standard"
+        
+        if senso_enabled:
+            hour_of_day = tnow_hrs % 24.0
+            
+            # Holiday mode overrides everything except Legionella
+            if holiday_mode:
+                active_setpoint = holiday_temp
+                current_mode = "Holiday"
+            # Boost mode - maximum power and increased setpoint
+            elif boost_mode:
+                active_setpoint = min(comfort_temp + 5, 65)
+                current_mode = "Boost"
+            # Time program control
+            elif enable_time_program:
+                # Check if in comfort period
+                in_morning = morning_start <= hour_of_day < morning_end
+                in_evening = evening_start <= hour_of_day < evening_end
+                
+                if in_morning or in_evening:
+                    active_setpoint = comfort_temp
+                    current_mode = "Comfort"
+                else:
+                    active_setpoint = eco_temp
+                    current_mode = "ECO"
+            # Fixed mode (no time program)
+            elif comfort_mode == "ECO":
+                active_setpoint = eco_temp
+                current_mode = "ECO"
+            elif comfort_mode == "Comfort":
+                active_setpoint = comfort_temp
+                current_mode = "Comfort"
+            elif comfort_mode == "Auto":
+                # Auto mode uses time program by default
+                hour_of_day = tnow_hrs % 24.0
+                in_morning = morning_start <= hour_of_day < morning_end
+                in_evening = evening_start <= hour_of_day < evening_end
+                
+                if in_morning or in_evening:
+                    active_setpoint = comfort_temp
+                    current_mode = "Auto-Comfort"
+                else:
+                    active_setpoint = eco_temp
+                    current_mode = "Auto-ECO"
+        
+        # Store SensoComfort state
+        Senso_mode[k] = current_mode
+        Senso_setpoint[k] = active_setpoint
+
+        # ============================================================
+        # 🦠 LEGIONELLA CYCLE LOGIC (overrides SensoComfort)
         # ============================================================
         legionella_override = False
         
@@ -472,29 +539,39 @@ def run_sim(
                     legionella_in_progress = False
         
         # ============================================================
-        # HEAT PUMP CONTROL (with Legionella override)
+        # HEAT PUMP CONTROL (with Legionella override and SensoComfort)
         # ============================================================
         mod = 0.0
         on = False
         
+        # Use appropriate setpoint based on mode
+        target_temp = legionella_temp if legionella_override else active_setpoint
+        target_hyst = 5.0 if legionella_override else hyst
+        Ton = target_temp - target_hyst
+        
+        # Boost mode modifies modulation behavior
+        boost_factor = 1.5 if (boost_mode and senso_enabled and not legionella_override) else 1.0
+        
         if legionella_override:
             # During Legionella cycle: heat to legionella_temp
-            if T_top < legionella_temp:
+            if T_top < target_temp:
                 on = True
-                if T_top <= legionella_temp - 5.0:
+                if T_top <= target_temp - 5.0:
                     mod = 1.0  # Full power when far from target
                 else:
-                    raw = (legionella_temp - T_top) / 5.0
+                    raw = (target_temp - T_top) / 5.0
                     mod = max(Pmin, np.clip(raw, 0.0, 1.0))
         else:
-            # Normal operation: heat to setpoint
-            if T_top < setp:
+            # Normal operation: heat to active setpoint (may be SensoComfort controlled)
+            if T_top < target_temp:
                 on = True
                 if T_top <= Ton:
-                    mod = 1.0
+                    mod = min(1.0, 1.0 * boost_factor)  # Boost mode increases power
                 else:
-                    raw = (setp - T_top) / hyst
+                    raw = (target_temp - T_top) / target_hyst
                     mod = Pmin + (1 - Pmin) * np.clip(raw, 0.0, 1.0)
+                    if boost_factor > 1.0:
+                        mod = min(1.0, mod * boost_factor)
         if mod < Pmin:
             on = False
             mod = 0.0
@@ -556,6 +633,8 @@ def run_sim(
         "Tap Temp (°C)": Tap_temp,
         "Q_Loss (W)": Qloss_total,
         "Legionella_Active": Legionella_active,
+        "Senso_Mode": Senso_mode,
+        "Senso_Setpoint (°C)": Senso_setpoint,
     })
 
     for i, name in enumerate(layer_order):
@@ -786,6 +865,38 @@ def chart_legionella(df: pd.DataFrame):
     
     return chart
 
+def chart_sensocomfort(df: pd.DataFrame):
+    """Chart showing SensoComfort mode changes and setpoint over time."""
+    base = alt.Chart(df).encode(x=alt.X("Time (h):Q", title="Time (hours)"))
+    
+    # Top layer temperature
+    temp_line = base.mark_line(color="#2563eb", strokeWidth=2).encode(
+        y=alt.Y("T_Top Layer (°C):Q", title="Temperature (°C)")
+    )
+    
+    # SensoComfort setpoint
+    setpoint_line = base.mark_line(color="#f59e0b", strokeWidth=2, strokeDash=[5, 5]).encode(
+        y=alt.Y("Senso_Setpoint (°C):Q")
+    )
+    
+    chart = (temp_line + setpoint_line).properties(
+        height=300,
+        title="SensoComfort Control: Temperature vs Setpoint"
+    )
+    
+    # Add day markers for 7-day view
+    max_time = df["Time (h)"].max()
+    if max_time > 48:
+        day_lines = pd.DataFrame({
+            'x': [24 * i for i in range(1, int(max_time / 24) + 1)]
+        })
+        rule = alt.Chart(day_lines).mark_rule(strokeDash=[4, 4], color='gray', opacity=0.5).encode(
+            x='x:Q'
+        )
+        chart = chart + rule
+    
+    return chart
+
 # ==============================================================
 # MAIN APPLICATION
 # ==============================================================
@@ -825,6 +936,73 @@ def main():
         hyst = st.slider("Hysteresis (°C)", 1.0, 10.0, 5.0, 0.5, key="param_hyst")
         Pmax = st.slider("Max HP Power Ratio", 0.5, 1.0, 1.0, 0.05, key="param_pmax")
         Pmin = st.slider("Min Modulation Ratio", 0.1, 0.5, 0.2, 0.05, key="param_pmin")
+
+        st.markdown("---")
+        st.markdown("### 🎛️ SensoComfort Controls")
+        
+        senso_enabled = st.radio(
+            "Enable SensoComfort Smart Control",
+            ["Off", "On"],
+            index=0,
+            horizontal=True,
+            key="senso_toggle"
+        )
+        
+        if senso_enabled == "On":
+            st.markdown("#### Comfort Settings")
+            comfort_mode = st.selectbox(
+                "Comfort Mode",
+                ["ECO", "Comfort", "Auto"],
+                index=1,
+                key="comfort_mode"
+            )
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                eco_temp = st.number_input("ECO Temperature (°C)", 40, 60, 45, 1, key="eco_temp")
+            with col2:
+                comfort_temp = st.number_input("Comfort Temperature (°C)", 45, 65, 55, 1, key="comfort_temp")
+            
+            st.markdown("#### Time Program")
+            enable_time_program = st.checkbox("Enable Time Program", value=True, key="enable_time_program")
+            
+            if enable_time_program:
+                st.markdown("**Morning Comfort Period**")
+                col1, col2 = st.columns(2)
+                with col1:
+                    morning_start = st.slider("Start Hour", 0, 23, 6, 1, key="morning_start")
+                with col2:
+                    morning_end = st.slider("End Hour", 0, 23, 9, 1, key="morning_end")
+                
+                st.markdown("**Evening Comfort Period**")
+                col1, col2 = st.columns(2)
+                with col1:
+                    evening_start = st.slider("Start Hour", 0, 23, 17, 1, key="evening_start")
+                with col2:
+                    evening_end = st.slider("End Hour", 0, 23, 22, 1, key="evening_end")
+            else:
+                morning_start, morning_end = 6, 9
+                evening_start, evening_end = 17, 22
+            
+            st.markdown("#### Advanced Features")
+            boost_mode = st.checkbox("Quick Heat-up Mode", value=False, key="boost_mode")
+            holiday_mode = st.checkbox("Holiday Mode (Reduced Temp)", value=False, key="holiday_mode")
+            
+            if holiday_mode:
+                holiday_temp = st.slider("Holiday Temperature (°C)", 35, 50, 40, 1, key="holiday_temp")
+            else:
+                holiday_temp = 40
+                
+        else:
+            comfort_mode = "Comfort"
+            eco_temp = 45
+            comfort_temp = 55
+            enable_time_program = False
+            morning_start, morning_end = 6, 9
+            evening_start, evening_end = 17, 22
+            boost_mode = False
+            holiday_mode = False
+            holiday_temp = 40
 
         st.markdown("---")
         st.markdown("### 🦠 Legionella Protection")
@@ -940,6 +1118,18 @@ def main():
         "legionella_duration": legionella_duration,
         "legionella_frequency": legionella_frequency,
         "legionella_start_hour": legionella_start_hour,
+        "senso_enabled": senso_enabled == "On",
+        "comfort_mode": comfort_mode,
+        "eco_temp": eco_temp,
+        "comfort_temp": comfort_temp,
+        "enable_time_program": enable_time_program,
+        "morning_start": morning_start,
+        "morning_end": morning_end,
+        "evening_start": evening_start,
+        "evening_end": evening_end,
+        "boost_mode": boost_mode,
+        "holiday_mode": holiday_mode,
+        "holiday_temp": holiday_temp,
     }
     param_key = tuple(params.values())
 
@@ -968,6 +1158,18 @@ def main():
                 legionella_duration=params["legionella_duration"],
                 legionella_frequency=params["legionella_frequency"],
                 legionella_start_hour=params["legionella_start_hour"],
+                senso_enabled=params["senso_enabled"],
+                comfort_mode=params["comfort_mode"],
+                eco_temp=params["eco_temp"],
+                comfort_temp=params["comfort_temp"],
+                enable_time_program=params["enable_time_program"],
+                morning_start=params["morning_start"],
+                morning_end=params["morning_end"],
+                evening_start=params["evening_start"],
+                evening_end=params["evening_end"],
+                boost_mode=params["boost_mode"],
+                holiday_mode=params["holiday_mode"],
+                holiday_temp=params["holiday_temp"],
             )
             st.session_state["df"] = df
             st.session_state["summary"] = summary
@@ -1104,6 +1306,7 @@ def main():
                 "HP Modulation & On/Off State",
                 "Tap Flow (L/min)",
                 "🦠 Legionella Cycle Activity",
+                "🎛️ SensoComfort Control",
             ],
             key="graph_choice"
         )
@@ -1122,6 +1325,26 @@ def main():
             st.altair_chart(chart_tap(df), use_container_width=True)
         elif choice == "🦠 Legionella Cycle Activity":
             st.altair_chart(chart_legionella(df), use_container_width=True)
+        elif choice == "🎛️ SensoComfort Control":
+            st.altair_chart(chart_sensocomfort(df), use_container_width=True)
+            
+            # Show mode distribution
+            if senso_enabled == "On":
+                st.markdown("---")
+                st.markdown("#### SensoComfort Mode Distribution")
+                mode_counts = df['Senso_Mode'].value_counts()
+                mode_df = pd.DataFrame({
+                    'Mode': mode_counts.index,
+                    'Time (hours)': (mode_counts.values * params["dtm"]) / 60
+                })
+                
+                mode_chart = alt.Chart(mode_df).mark_bar().encode(
+                    x=alt.X('Mode:N', title='Operating Mode'),
+                    y=alt.Y('Time (hours):Q', title='Time (hours)'),
+                    color=alt.Color('Mode:N', legend=None)
+                ).properties(height=250)
+                
+                st.altair_chart(mode_chart, use_container_width=True)
 
         # ==============================================================
         # 💬 AI CHATBOT SECTION (BELOW GRAPHS)
