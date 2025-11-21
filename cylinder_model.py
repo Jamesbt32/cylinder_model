@@ -382,6 +382,7 @@ def run_sim(
     Pmax: float,
     Tsrc: float,
     tap: Dict[str, List[float]],
+    initial_tank_temp: float,
     legionella_enabled: bool = False,
     legionella_temp: float = 65.0,
     legionella_duration: float = 30.0,
@@ -399,8 +400,9 @@ def run_sim(
     boost_mode: bool = False,
     holiday_mode: bool = False,
     holiday_temp: float = 40.0,
+    adaptive_timestep: bool = True,
 ):
-    """4-layer stratified tank simulation with optional Legionella cycle and SensoComfort controls."""
+    """4-layer stratified tank simulation with adaptive time stepping, improved tapping, and enhanced mixing."""
     for key in ["time", "volume", "rate_lpm"]:
         if key not in tap:
             raise ValueError(f"tap dict missing '{key}'")
@@ -410,9 +412,32 @@ def run_sim(
     tap_rate = np.array(tap["rate_lpm"])
 
     N_layers = 4
-    dt_s = dt_min * 60.0
-    steps = int(sim_hrs * 60.0 / dt_min)
-    time_h = np.arange(0, steps * dt_min, dt_min) / 60.0
+    
+    # ============================================================
+    # ADAPTIVE TIME STEPPING CONFIGURATION
+    # ============================================================
+    if adaptive_timestep:
+        dt_base = dt_min * 60.0  # Base time step in seconds
+        dt_tap = max(dt_min * 60.0 / 3, 60.0)  # 1/3 of base or minimum 1 minute
+    else:
+        dt_base = dt_min * 60.0
+        dt_tap = dt_base
+    
+    # Dynamic arrays for adaptive timestep
+    time_array = []
+    T_array = []
+    Qhp_array = []
+    Pel_array = []
+    COPs_array = []
+    HP_on_array = []
+    Qloss_total_array = []
+    Tap_flow_array = []
+    Tap_temp_array = []
+    Mod_frac_array = []
+    Legionella_active_array = []
+    Senso_mode_array = []
+    Senso_setpoint_array = []
+    Tap_active_array = []
 
     def mm2_to_m2(x): return x / 1e6
     layer_order = ["Bottom Layer", "Lower-Mid Layer", "Upper-Mid Layer", "Top Layer"]
@@ -431,34 +456,45 @@ def run_sim(
     Ton = setp - hyst
     coil_bottom_idx = 2
 
-    T = np.zeros((steps, N_layers))
-    Qhp = np.zeros(steps)
-    Pel = np.zeros(steps)
-    COPs = np.zeros(steps)
-    HP_on = np.zeros(steps, bool)
-    Qloss_total = np.zeros(steps)
-    Tap_flow = np.zeros(steps)
-    Tap_temp = np.zeros(steps)
-    Mod_frac = np.zeros(steps)
-    Legionella_active = np.zeros(steps, bool)
-    Senso_mode = np.zeros(steps, dtype='<U10')  # Store mode as string
-    Senso_setpoint = np.zeros(steps)
+    # Initial temperatures
+    T_prev = np.full(N_layers, initial_tank_temp, dtype=float)
 
-    T_bottom_init = setp - 15.0
-    T_top_init = setp
-    T[0, :] = np.linspace(T_bottom_init, T_top_init, N_layers)
 
     # Legionella cycle tracking
     legionella_cycle_start_time = None
     legionella_in_progress = False
-
-    for k in range(1, steps):
-        T_prev = T[k - 1, :].copy()
+    
+    # Simulation time tracking
+    tnow_s = 0.0
+    sim_end_s = sim_hrs * 3600.0
+    
+    step_count = 0
+    max_steps = int(sim_hrs * 60.0 * 60.0 / 60.0) * 2  # Safety factor for adaptive steps
+    
+    # ============================================================
+    # MAIN SIMULATION LOOP WITH ADAPTIVE TIME STEPPING
+    # ============================================================
+    while tnow_s < sim_end_s and step_count < max_steps:
+        # Determine if tapping is occurring in the upcoming time window
+        tnow_min = tnow_s / 60.0
+        tnow_hrs = tnow_s / 3600.0
+        
+        # Check for tapping in next base time step
+        tap_check_end = tnow_min + (dt_base / 60.0)
+        idx_check = np.where((tap_time >= tnow_min) & (tap_time < tap_check_end))[0]
+        is_tapping = len(idx_check) > 0
+        
+        # Select adaptive time step
+        if adaptive_timestep and is_tapping:
+            dt_s = dt_tap  # Use fine time step during tapping
+        else:
+            dt_s = dt_base  # Use coarse time step otherwise
+        
+        dt_current_min = dt_s / 60.0
+        
         T_new = T_prev.copy()
         T_top = T_prev[-1]
         T_bottom = T_prev[0]
-        tnow_min = k * dt_min
-        tnow_hrs = tnow_min / 60.0
 
         # ============================================================
         # 🎛️ SENSOCOMFORT CONTROL LOGIC
@@ -508,10 +544,6 @@ def run_sim(
                 else:
                     active_setpoint = eco_temp
                     current_mode = "Auto-ECO"
-        
-        # Store SensoComfort state
-        Senso_mode[k] = current_mode
-        Senso_setpoint[k] = active_setpoint
 
         # ============================================================
         # 🦠 LEGIONELLA CYCLE LOGIC (overrides SensoComfort)
@@ -534,7 +566,6 @@ def run_sim(
                 elapsed = tnow_min - legionella_cycle_start_time
                 if elapsed < legionella_duration:
                     legionella_override = True
-                    Legionella_active[k] = True
                 else:
                     legionella_in_progress = False
         
@@ -575,78 +606,140 @@ def run_sim(
         if mod < Pmin:
             on = False
             mod = 0.0
-        Mod_frac[k] = mod
 
         Q = Pe = COP = 0.0
         if on:
             Q, Pe, COP = solve_hp(T_bottom, mod, Pmax_W, Pmin_W, Pmin)
-        HP_on[k] = on
-        Qhp[k] = Q
-        Pel[k] = Pe
-        COPs[k] = COP
 
-        idx = np.where((tap_time > tnow_min - dt_min) & (tap_time <= tnow_min))[0]
+        # ============================================================
+        # IMPROVED TAPPING WITH INSTANTANEOUS FLOW RATE
+        # ============================================================
+        idx = np.where((tap_time >= tnow_min) & (tap_time < tnow_min + dt_current_min))[0]
         Vtap_L = np.sum(tap_vol[idx]) if idx.size > 0 else 0.0
-        mdot_tap = (Vtap_L / 1000.0) * RHO / dt_s
-        Tap_flow[k] = np.sum(tap_rate[idx]) if idx.size > 0 else 0.0
-        Tap_temp[k] = T_top
+        tap_rate_current = np.sum(tap_rate[idx]) if idx.size > 0 else 0.0
+        
+        # Calculate actual tap duration within this time step
+        tap_duration_s = 0.0
+        if len(idx) > 0:
+            for i in idx:
+                # Each tap event has a duration based on volume and rate
+                duration = (tap_vol[i] / tap_rate[i]) * 60.0  # seconds
+                tap_duration_s += duration
+        
+        # Mass flow rate during tapping (instantaneous, not averaged)
+        if tap_duration_s > 0:
+            mdot_tap = (Vtap_L / 1000.0) * RHO / tap_duration_s
+        else:
+            mdot_tap = 0.0
+        
+        tap_active = tap_duration_s > 0
 
+        # ============================================================
+        # ENERGY BALANCE FOR EACH LAYER
+        # ============================================================
+        Q_loss_total = 0.0
+        
         for i in range(N_layers):
             Q_net = 0.0
 
+            # Internal heat transfer
             if i > 0:
                 Q_net += UA_int_layer[i] * (T_prev[i - 1] - T_prev[i])
             if i < N_layers - 1:
                 Q_net += UA_int_layer[i] * (T_prev[i + 1] - T_prev[i])
 
+            # External loss
             Q_loss = UA_loss_layer[i] * (T_prev[i] - Tamb)
             Q_net -= Q_loss
-            Qloss_total[k] += Q_loss
+            Q_loss_total += Q_loss
 
-            if i < coil_bottom_idx and Qhp[k] > 0:
-                Q_net += Qhp[k] / coil_bottom_idx
+            # Heat pump input (bottom layers only)
+            if i < coil_bottom_idx and Q > 0:
+                Q_net += Q / coil_bottom_idx
 
-            if i == N_layers - 1:
-                Q_net -= mdot_tap * C_P * T_prev[i]
-            elif i == 0:
-                Q_net += mdot_tap * C_P * Tamb
+            # Tapping: proportional energy removal based on actual tap duration
+            if i == N_layers - 1 and tap_duration_s > 0:
+                Q_tap_out = mdot_tap * C_P * T_prev[i]
+                # Scale by the fraction of time step that tapping occurs
+                tap_fraction = min(tap_duration_s / dt_s, 1.0)
+                Q_net -= Q_tap_out * tap_fraction
+            elif i == 0 and tap_duration_s > 0:
+                Q_tap_in = mdot_tap * C_P * Tamb
+                tap_fraction = min(tap_duration_s / dt_s, 1.0)
+                Q_net += Q_tap_in * tap_fraction
 
+            # Temperature update
+            # Temperature update
             dT = Q_net * dt_s / (m_layer[i] * C_P)
             T_new[i] = np.clip(T_prev[i] + dT, 0.0, 100.0)
 
+        # ============================================================
+        # IMPROVED ANTI-DESTRATIFICATION (GRADUAL MIXING 80/20)
+        # ============================================================
         for i in range(N_layers - 1):
             if T_new[i] > T_new[i + 1]:
-                avg = 0.5 * (T_new[i] + T_new[i + 1])
-                T_new[i] = avg
-                T_new[i + 1] = avg
+                # Gradual mixing (80/20 blend instead of 50/50)
+                T_upper = T_new[i + 1]
+                T_lower = T_new[i]
+                T_new[i] = 0.8 * T_lower + 0.2 * T_upper
+                T_new[i + 1] = 0.2 * T_lower + 0.8 * T_upper
 
-        T[k, :] = T_new
+        # Store results in dynamic arrays
+        time_array.append(tnow_hrs)
+        T_array.append(T_new.copy())
+        Qhp_array.append(Q)
+        Pel_array.append(Pe)
+        COPs_array.append(COP)
+        HP_on_array.append(on)
+        Qloss_total_array.append(Q_loss_total)
+        Tap_flow_array.append(tap_rate_current)
+        Tap_temp_array.append(T_new[-1])
+        Mod_frac_array.append(mod)
+        Legionella_active_array.append(legionella_override)
+        Senso_mode_array.append(current_mode)
+        Senso_setpoint_array.append(active_setpoint)
+        Tap_active_array.append(tap_active)
+        
+        # Update for next iteration
+        T_prev = T_new
+        tnow_s += dt_s
+        step_count += 1
 
+    # ============================================================
+    # CONVERT DYNAMIC ARRAYS TO DATAFRAME
+    # ============================================================
+    time_h = np.array(time_array)
+    T_matrix = np.array(T_array)
+    
     df = pd.DataFrame({
         "Time (h)": time_h,
-        "HP Power (W)": Pel,
-        "HP Heat (W)": Qhp,
-        "COP": COPs,
-        "HP_On": HP_on,
-        "Modulation": Mod_frac,
-        "Tap Flow (L/min)": Tap_flow,
-        "Tap Temp (°C)": Tap_temp,
-        "Q_Loss (W)": Qloss_total,
-        "Legionella_Active": Legionella_active,
-        "Senso_Mode": Senso_mode,
-        "Senso_Setpoint (°C)": Senso_setpoint,
+        "HP Power (W)": Pel_array,
+        "HP Heat (W)": Qhp_array,
+        "COP": COPs_array,
+        "HP_On": HP_on_array,
+        "Modulation": Mod_frac_array,
+        "Tap Flow (L/min)": Tap_flow_array,
+        "Tap Temp (°C)": Tap_temp_array,
+        "Q_Loss (W)": Qloss_total_array,
+        "Legionella_Active": Legionella_active_array,
+        "Senso_Mode": Senso_mode_array,
+        "Senso_Setpoint (°C)": Senso_setpoint_array,
+        "Tap_Active": Tap_active_array,
     })
 
     for i, name in enumerate(layer_order):
-        df[f"T_{name} (°C)"] = T[:, i]
-    df["T_Avg (°C)"] = T.mean(axis=1)
+        df[f"T_{name} (°C)"] = T_matrix[:, i]
+    df["T_Avg (°C)"] = T_matrix.mean(axis=1)
 
-    total_heat_kWh = df["HP Heat (W)"].sum() * dt_s / 3.6e6
-    total_power_kWh = df["HP Power (W)"].sum() * dt_s / 3.6e6
-    total_losses_kWh = df["Q_Loss (W)"].sum() * dt_s / 3.6e6
-    hp_runtime_min = int(df["HP_On"].sum() * dt_min)
+    # Calculate energy with variable time steps
+    df['dt_hours'] = df['Time (h)'].diff().fillna(dt_base / 3600.0)
+    
+    total_heat_kWh = (df["HP Heat (W)"] * df['dt_hours']).sum()
+    total_power_kWh = (df["HP Power (W)"] * df['dt_hours']).sum()
+    total_losses_kWh = (df["Q_Loss (W)"] * df['dt_hours']).sum()
+    hp_runtime_min = (df["HP_On"].astype(float) * df['dt_hours'] * 60).sum()
     avg_cop = total_heat_kWh / total_power_kWh if total_power_kWh > 0 else 0.0
-    legionella_runtime_min = int(df["Legionella_Active"].sum() * dt_min) if legionella_enabled else 0
+    legionella_runtime_min = (df["Legionella_Active"].astype(float) * df['dt_hours'] * 60).sum() if legionella_enabled else 0
 
     summary = {
         "Simulation Hours": sim_hrs,
@@ -662,6 +755,125 @@ def run_sim(
     return df, summary, BASE_LAYER_PROPERTIES
 
 # ---------- CHARTS ----------
+
+# GLOBAL shared selection for synced hover across all charts
+global_hover = alt.selection_point(
+    fields=["Time (h)"],
+    nearest=True,
+    on="mousemove",
+    empty=False
+)
+
+def add_hover_summary(base_chart, df, fields):
+    """
+    Adds:
+    - Synced hover rule across all charts (using global_hover)
+    - Multi-field tooltip
+    - Cursor point
+    """
+    # Invisible selector that binds the hover to this chart
+    selectors = (
+        alt.Chart(df)
+        .mark_point(opacity=0)
+        .encode(x="Time (h):Q")
+        .add_params(global_hover)
+    )
+
+    # Synced vertical rule across charts
+    rule = (
+        alt.Chart(df)
+        .mark_rule(color="gray")
+        .encode(x="Time (h):Q")
+        .transform_filter(global_hover)
+    )
+
+    # Tooltip+dot
+    tooltip_fields = [
+        alt.Tooltip(col, title=title, format=".2f")
+        for col, title in fields
+    ]
+
+    points = (
+        alt.Chart(df)
+        .mark_circle(size=60, color="black")
+        .encode(
+            x="Time (h):Q",
+            y=fields[0][0] + ":Q",
+            tooltip=tooltip_fields,
+        )
+        .transform_filter(global_hover)
+    )
+
+    # Add shading behind base chart
+    shading = add_state_shading(df)
+
+    return shading + base_chart + selectors + rule + points
+
+
+def add_state_shading(df):
+    """
+    Creates layered background shading for:
+    - Tap active
+    - Legionella active
+    - Comfort/ECO/Holiday modes
+    Returns an Altair chart layer that can be added behind any chart.
+    """
+    layers = []
+
+    # --- 1. TAPPING (orange) ---
+    tap_df = df[df["Tap_Active"] == True]
+    if len(tap_df) > 0:
+        tap_layer = (
+            alt.Chart(tap_df)
+            .mark_rect(opacity=0.15, color="#f59e0b")
+            .encode(
+                x="Time (h):Q",
+                x2="Time (h):Q"
+            )
+        )
+        layers.append(tap_layer)
+
+    # --- 2. LEGIONELLA (purple) ---
+    leg_df = df[df["Legionella_Active"] == True]
+    if len(leg_df) > 0:
+        leg_layer = (
+            alt.Chart(leg_df)
+            .mark_rect(opacity=0.12, color="#8b5cf6")
+            .encode(
+                x="Time (h):Q",
+                x2="Time (h):Q"
+            )
+        )
+        layers.append(leg_layer)
+
+    # --- 3. SensoComfort Modes (blue, green, pink) ---
+    mode_colors = {
+        "Comfort": "#60a5fa",
+        "Auto-Comfort": "#60a5fa",
+        "ECO": "#4ade80",
+        "Auto-ECO": "#4ade80",
+        "Holiday": "#f9a8d4",
+        "Boost": "#f87171"
+    }
+
+    for mode, color in mode_colors.items():
+        mode_df = df[df["Senso_Mode"] == mode]
+        if len(mode_df) > 0:
+            rect = (
+                alt.Chart(mode_df)
+                .mark_rect(opacity=0.10, color=color)
+                .encode(
+                    x="Time (h):Q",
+                    x2="Time (h):Q"
+                )
+            )
+            layers.append(rect)
+
+    if layers:
+        return alt.layer(*layers)
+    else:
+        return alt.Chart()
+
 def chart_stratification(df: pd.DataFrame):
     cols = [c for c in df.columns if c.startswith("T_") and "Avg" not in c]
     d = df.melt("Time (h)", value_vars=cols, var_name="Layer", value_name="Temp (°C)")
@@ -763,6 +975,46 @@ def chart_heat(df: pd.DataFrame):
         chart = chart + rule
     
     return chart
+
+def chart_tank_losses(df: pd.DataFrame):
+    """
+    Plot total tank losses (W), with synced hover and shading.
+    """
+    base = (
+        alt.Chart(df)
+        .mark_line(color="#9333ea", strokeWidth=2)
+        .encode(
+            x=alt.X("Time (h):Q", title="Time (hours)", axis=alt.Axis(grid=True)),
+            y=alt.Y("Q_Loss (W):Q", title="Tank Heat Loss (W)", scale=alt.Scale(zero=False))
+        )
+        .properties(height=300, title="Tank Heat Losses (W)")
+    )
+
+    fields = [
+        ("Q_Loss (W)", "Tank Loss (W)"),
+        ("T_Top Layer (°C)", "Top Temp (°C)"),
+        ("T_Avg (°C)", "Tank Avg Temp (°C)"),
+        ("HP Power (W)", "HP Power (W)"),
+        ("HP Heat (W)", "HP Heat (W)")
+    ]
+
+    chart = add_hover_summary(base, df, fields)
+
+    # Day markers for 2+ days
+    max_time = df["Time (h)"].max()
+    if max_time > 48:
+        day_lines = pd.DataFrame({
+            'x': [24 * i for i in range(1, int(max_time / 24) + 1)]
+        })
+        rule = (
+            alt.Chart(day_lines)
+            .mark_rule(strokeDash=[4, 4], color='gray', opacity=0.5)
+            .encode(x='x:Q')
+        )
+        chart = chart + rule
+
+    return chart
+
 
 def chart_cop(df: pd.DataFrame):
     chart = (
@@ -897,6 +1149,62 @@ def chart_sensocomfort(df: pd.DataFrame):
     
     return chart
 
+def chart_tapping_detail(df: pd.DataFrame):
+    """Detailed chart showing temperature response during tapping events."""
+    base = alt.Chart(df).encode(x=alt.X("Time (h):Q", title="Time (hours)"))
+    
+    # Temperature line
+    temp_line = base.mark_line(color="#dc2626", strokeWidth=2).encode(
+        y=alt.Y("T_Top Layer (°C):Q", title="Temperature (°C)", scale=alt.Scale(zero=False))
+    )
+    
+    # Tap active indicator (shaded regions)
+    tap_active_df = df[df["Tap_Active"] == True].copy()
+    if len(tap_active_df) > 0:
+        tap_bars = alt.Chart(tap_active_df).mark_rect(
+            opacity=0.2,
+            color="orange"
+        ).encode(
+            x="Time (h):Q",
+            x2=alt.X2("Time (h):Q"),
+            y=alt.value(0),
+            y2=alt.value(400)
+        )
+        chart = temp_line + tap_bars
+    else:
+        chart = temp_line
+    
+    chart = chart.properties(
+        height=300,
+        title="Top Layer Temperature During Tapping (Orange = Tap Active)"
+    )
+    
+    # Add day markers for 7-day view
+    max_time = df["Time (h)"].max()
+    if max_time > 48:
+        day_lines = pd.DataFrame({
+            'x': [24 * i for i in range(1, int(max_time / 24) + 1)]
+        })
+        rule = alt.Chart(day_lines).mark_rule(strokeDash=[4, 4], color='gray', opacity=0.5).encode(
+            x='x:Q'
+        )
+        chart = chart + rule
+    
+    return chart
+
+def chart_tank_temperature(df: pd.DataFrame):
+    chart = (
+        alt.Chart(df)
+        .mark_line(color="#10b981")
+        .encode(
+            x=alt.X("Time (h):Q", title="Time (hours)"),
+            y=alt.Y("T_Avg (°C):Q", title="Average Tank Temperature (°C)")
+        )
+        .properties(height=300, title="Average Tank Temperature Over Time")
+    )
+    return chart
+
+
 # ==============================================================
 # MAIN APPLICATION
 # ==============================================================
@@ -918,6 +1226,14 @@ def main():
             horizontal=True,
             key="sim_period"
         )
+
+        # --- Initial tank temperature (MUST be defined before params dict) ---
+        initial_tank_temp = st.slider(
+        "Initial Tank Temperature (°C)",
+        20, 70, 45, 1,
+        key="param_init_tank_temp"
+)
+
         
         # Set simulation hours based on selection
         if sim_period == "24 Hours":
@@ -1130,6 +1446,7 @@ def main():
         "boost_mode": boost_mode,
         "holiday_mode": holiday_mode,
         "holiday_temp": holiday_temp,
+        "adaptive_timestep": True,  # Enable adaptive time stepping
     }
     param_key = tuple(params.values())
 
@@ -1170,6 +1487,9 @@ def main():
                 boost_mode=params["boost_mode"],
                 holiday_mode=params["holiday_mode"],
                 holiday_temp=params["holiday_temp"],
+                adaptive_timestep=params["adaptive_timestep"],
+                initial_tank_temp=initial_tank_temp,
+
             )
             st.session_state["df"] = df
             st.session_state["summary"] = summary
@@ -1297,19 +1617,24 @@ def main():
         st.caption(f"Viewing: **{period_label}** simulation results")
         
         choice = st.selectbox(
-            "Select a graph:",
-            [
-                "Coefficient of Performance (COP)",
-                "Tank Stratification (Multi-Layer)",
-                "Heat Pump Power (W)",
-                "Heat Pump Heat Output (W)",
-                "HP Modulation & On/Off State",
-                "Tap Flow (L/min)",
-                "🦠 Legionella Cycle Activity",
-                "🎛️ SensoComfort Control",
-            ],
-            key="graph_choice"
-        )
+        "Select a graph:",
+    [
+        "Coefficient of Performance (COP)",
+        "Tank Stratification (Multi-Layer)",
+        "Heat Pump Power (W)",
+        "Heat Pump Heat Output (W)",
+        "HP Modulation & On/Off State",
+        "Tap Flow (L/min)",
+        "🦠 Legionella Cycle Activity",
+        "🔥 Tank Heat Losses (W)",
+        "🎛️ SensoComfort Control",
+        "🚿 Tapping Detail (Temperature Response)",
+        "🌡️ Tank Temperature (Average)",
+    ],
+    key="graph_choice"
+)
+
+        
 
         if choice == "Coefficient of Performance (COP)":
             st.altair_chart(chart_cop(df), use_container_width=True)
@@ -1319,6 +1644,8 @@ def main():
             st.altair_chart(chart_power(df), use_container_width=True)
         elif choice == "Heat Pump Heat Output (W)":
             st.altair_chart(chart_heat(df), use_container_width=True)
+        elif choice == "🔥 Tank Heat Losses (W)":
+            st.altair_chart(chart_tank_losses(df), use_container_width=True)
         elif choice == "HP Modulation & On/Off State":
             st.altair_chart(chart_modulation(df), use_container_width=True)
         elif choice == "Tap Flow (L/min)":
@@ -1327,6 +1654,9 @@ def main():
             st.altair_chart(chart_legionella(df), use_container_width=True)
         elif choice == "🎛️ SensoComfort Control":
             st.altair_chart(chart_sensocomfort(df), use_container_width=True)
+        elif choice == "🌡️ Tank Temperature (Average)":
+            st.altair_chart(chart_tank_temperature(df), use_container_width=True)
+
             
             # Show mode distribution
             if senso_enabled == "On":
@@ -1345,6 +1675,11 @@ def main():
                 ).properties(height=250)
                 
                 st.altair_chart(mode_chart, use_container_width=True)
+        elif choice == "🚿 Tapping Detail (Temperature Response)":
+            st.altair_chart(chart_tapping_detail(df), use_container_width=True)
+            st.info("🔍 **Adaptive Time Stepping Enabled**: Orange shaded areas show when tapping occurs. "
+                   "Notice the rapid temperature drops during tap events - this improved model captures transients "
+                   "that were averaged out in the original 5-minute timestep approach!")
 
         # ==============================================================
         # 💬 AI CHATBOT SECTION (BELOW GRAPHS)
