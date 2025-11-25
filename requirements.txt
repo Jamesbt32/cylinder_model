@@ -39,7 +39,6 @@ pyarrow==21.0.0
 pycparser==2.23
 pydeck==0.9.1
 pyparsing==3.2.4
-python-3.11
 python-dateutil==2.9.0.post0
 pytz==2025.2
 pyvista==0.43.6
@@ -64,6 +63,7 @@ urllib3==2.5.0
 watchdog==6.0.0
 websockets==15.0.1
 yfinance==0.2.66
+
 
 
 
