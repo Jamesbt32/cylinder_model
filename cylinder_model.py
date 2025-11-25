@@ -12,7 +12,12 @@ import pandas as pd
 import altair as alt
 from typing import List, Dict, Any
 from PyPDF2 import PdfReader
-import fitz
+try:
+    import fitz  # PyMuPDF
+    FITZ_AVAILABLE = True
+except Exception as e:
+    FITZ_AVAILABLE = False
+    print("⚠️ PyMuPDF not available:", e)
 import faiss
 from openai import OpenAI
 from difflib import SequenceMatcher
@@ -253,10 +258,8 @@ def retrieve_faiss_context(query: str, top_k: int = 3, show_debug: bool = False)
         return []
 
 def rebuild_knowledge_base():
-    """
-    Extracts text + diagrams from the Vaillant PDF, generates embeddings,
-    and builds FAISS + metadata.
-    """
+    """Streamlit-safe PDF → text + images → embeddings → FAISS"""
+
     st.info("📘 Starting knowledge base rebuild…")
 
     if not API_KEY or not client:
@@ -268,106 +271,130 @@ def rebuild_knowledge_base():
         st.error(f"❌ PDF not found: {pdf_path}")
         return
 
+    # ---------- Open PDF (text always works) ----------
     try:
         reader = PdfReader(pdf_path)
-        doc = fitz.open(pdf_path)
     except Exception as e:
-        st.error(f"Could not open PDF: {e}")
+        st.error(f"❌ Could not open PDF for text: {e}")
         return
 
-    items, page_texts, page_images = [], {}, {}
+    # ---------- Open PDF for images ONLY if fitz exists ----------
+    doc = None
+    if FITZ_AVAILABLE:
+        try:
+            doc = fitz.open(pdf_path)
+        except Exception as e:
+            st.warning(f"⚠️ Image extraction disabled: {e}")
+            doc = None
+    else:
+        st.warning("⚠️ PyMuPDF not available – skipping image extraction")
 
-    def chunk_text(text, max_len=700):
-        sents = text.split(". ")
-        chunks, buf, ln = [], [], 0
-        for s in sents:
+    items = []
+    page_images = {}
+
+    # ---------- Helper: chunk text ----------
+    def chunk_text(text, max_words=700):
+        sentences = text.split(". ")
+        chunks, buf, count = [], [], 0
+        for s in sentences:
             buf.append(s)
-            ln += len(s.split())
-            if ln > max_len:
+            count += len(s.split())
+            if count >= max_words:
                 chunks.append(". ".join(buf))
-                buf, ln = [], 0
+                buf, count = [], 0
         if buf:
             chunks.append(". ".join(buf))
         return chunks
 
-    # Extract text
-    st.info("📝 Extracting text from PDF…")
+    # ---------- Extract TEXT ----------
+    st.info("📝 Extracting text…")
+
     for pnum, page in enumerate(reader.pages, start=1):
         try:
             text = page.extract_text()
-            if text and len(text.strip()) > 20:
-                page_texts[pnum] = chunk_text(text.strip())
+            if text and len(text.strip()) > 50:
+                chunks = chunk_text(text.strip())
+                for c in chunks:
+                    items.append({
+                        "page": pnum,
+                        "text": c,
+                        "image_paths": []
+                    })
         except Exception as e:
-            st.warning(f"⚠️ Text extract error on page {pnum}: {e}")
+            st.warning(f"⚠️ Text extraction failed on page {pnum}: {e}")
 
-    # Extract images
-    st.info("🖼️ Extracting diagrams…")
-    base_dir = os.path.dirname(__file__)
-    kb_dir = os.path.join(base_dir, "kb")
-    img_dir = os.path.join(kb_dir, "diagrams")
-    os.makedirs(img_dir, exist_ok=True)
+    # ---------- Extract IMAGES (only if fitz is available) ----------
+    if doc:
+        st.info("🖼️ Extracting images…")
 
-    for pnum, page in enumerate(doc, start=1):
-        imgs = page.get_images(full=True)
-        if imgs:
-            for i, img in enumerate(imgs):
-                try:
+        base_dir = os.path.dirname(__file__)
+        kb_dir = os.path.join(base_dir, "kb")
+        img_dir = os.path.join(kb_dir, "diagrams")
+        os.makedirs(img_dir, exist_ok=True)
+
+        for pnum, page in enumerate(doc, start=1):
+            try:
+                imgs = page.get_images(full=True)
+                if not imgs:
+                    continue
+
+                for i, img in enumerate(imgs):
                     xref = img[0]
-                    base_image = doc.extract_image(xref)
-                    w, h = base_image.get("width", 0), base_image.get("height", 0)
+                    base = doc.extract_image(xref)
+                    w = base.get("width", 0)
+                    h = base.get("height", 0)
+
                     if w < 50 or h < 50:
                         continue
-                    fname = f"page_{pnum}_img_{i+1}.{base_image['ext']}"
-                    path = os.path.join(img_dir, fname)
-                    with open(path, "wb") as f:
-                        f.write(base_image["image"])
-                    page_images.setdefault(pnum, []).append(path)
-                except Exception as e:
-                    st.warning(f"⚠️ Image extract error on page {pnum}: {e}")
-        else:
-            try:
-                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-                path = os.path.join(img_dir, f"page_{pnum}.png")
-                pix.save(path)
-                page_images.setdefault(pnum, []).append(path)
+
+                    ext = base["ext"]
+                    fname = f"page_{pnum}_img_{i}.{ext}"
+                    out_path = os.path.join(img_dir, fname)
+
+                    with open(out_path, "wb") as f:
+                        f.write(base["image"])
+
+                    page_images.setdefault(pnum, []).append(out_path)
+
             except Exception as e:
-                st.warning(f"⚠️ Rasterization failed on page {pnum}: {e}")
+                st.warning(f"⚠️ Image extraction failed for page {pnum}: {e}")
 
-    # Combine text + images
-    for pnum, chunks in page_texts.items():
-        imgs = page_images.get(pnum, [])
-        for c in chunks:
-            items.append({"page": pnum, "text": c, "image_paths": imgs})
+    # ---------- Attach images to text chunks ----------
+    for it in items:
+        it["image_paths"] = page_images.get(it["page"], [])
 
-    st.success(f"✅ Extracted {len(items)} text chunks.")
+    st.success(f"✅ Extracted {len(items)} knowledge chunks")
 
-    # Generate embeddings
-    st.info("🔢 Generating OpenAI embeddings…")
-    embeddings = []
-    for i, it in enumerate(items, 1):
+    # ---------- Embeddings ----------
+    st.info("🔢 Generating embeddings…")
+    vectors = []
+
+    for i, item in enumerate(items):
         try:
-            emb = client.embeddings.create(model="text-embedding-3-large", input=it["text"])
-            embeddings.append(np.array(emb.data[0].embedding, dtype="float32"))
+            r = client.embeddings.create(
+                model="text-embedding-3-large",
+                input=item["text"]
+            )
+            vectors.append(np.array(r.data[0].embedding, dtype="float32"))
         except Exception as e:
-            st.warning(f"Embedding error at chunk {i}: {e}")
-            embeddings.append(np.zeros(3072, dtype="float32"))
-        if i % 25 == 0:
-            st.write(f"Progress: {i}/{len(items)} chunks")
+            st.warning(f"⚠️ Embedding failed for chunk {i}: {e}")
+            vectors.append(np.zeros(3072, dtype="float32"))
 
-    emb_matrix = np.vstack(embeddings)
-    faiss.normalize_L2(emb_matrix)
+    mat = np.vstack(vectors)
+    faiss.normalize_L2(mat)
 
-    # Build FAISS index
-    index = faiss.IndexFlatIP(emb_matrix.shape[1])
-    index.add(emb_matrix)
-
-    # Save
+    # ---------- Save FAISS ----------
+    kb_dir = os.path.join(os.path.dirname(__file__), "kb")
     os.makedirs(kb_dir, exist_ok=True)
+
+    index = faiss.IndexFlatIP(mat.shape[1])
+    index.add(mat)
+
     faiss.write_index(index, os.path.join(kb_dir, "vaillant_joint_faiss.index"))
     with open(os.path.join(kb_dir, "vaillant_joint_meta.json"), "w", encoding="utf-8") as f:
         json.dump(items, f, indent=2)
 
-    st.success("🎉 Knowledge base successfully rebuilt!")
+    st.success("🎉 Knowledge base rebuilt successfully!")
 
 # --- Logo ---
 try:
