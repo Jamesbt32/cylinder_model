@@ -22,11 +22,16 @@ from sklearn.linear_model import LogisticRegression
 from datetime import datetime
 import time
 
+alt.data_transformers.disable_max_rows()
+
+
 st.set_page_config(
     page_title="Vaillant 150 L Cylinder Model",
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+
 st.markdown("""
 <style>
 
@@ -423,11 +428,15 @@ def solve_hp(T_tank: float, mod: float, Pmax_W: float, Pmin_W: float, Pmin_ratio
     return Qhp, Pel, COP
 
 # ---------- SIMULATION ----------
+print(">>> run_sim started")
+
 buffer_layers = None
 buffer_history = []
+
 @st.cache_data
-# ✅ Always declare buffer_layers so Python knows it exists
 def run_sim(
+
+    
     dt_min: float,
     sim_hrs: float,
     Utank: float,
@@ -457,8 +466,14 @@ def run_sim(
     holiday_mode: bool = False,
     holiday_temp: float = 40.0,
     adaptive_timestep: bool = True,
+    buffer_enabled: bool = False,
+ 
+
 ):
     """4-layer stratified tank simulation with adaptive time stepping, improved tapping, and enhanced mixing."""
+    # --------------------------
+    # Validate tap dict
+    # --------------------------
     for key in ["time", "volume", "rate_lpm"]:
         if key not in tap:
             raise ValueError(f"tap dict missing '{key}'")
@@ -469,46 +484,42 @@ def run_sim(
 
     N_layers = 4
 
-
-     # ===============================
+    # ===============================
     # BUFFER STRATIFICATION SETUP ✅
     # ===============================
     N_buf = 4
     BUFFER_RHO = 1000.0
     BUFFER_CP = 4186.0
 
-    buffer_enabled_flag = st.session_state.get("buffer_enabled", "Off")
+    buffer_enabled_flag = "On" if buffer_enabled else "Off"
     buffer_volume_L = st.session_state.get("buffer_volume_L", 0)
     buffer_temp_init = st.session_state.get("buffer_temp_init", 45)
     immersion_enabled = st.session_state.get("immersion_enabled", False)
     immersion_power_kw = st.session_state.get("immersion_power_kw", 0.0)
     boost_cylinder = st.session_state.get("boost_cylinder", False)
     pump_flow_lpm = st.session_state.get("pump_flow_lpm", 0)
-    # ✅ Always declare buffer arrays so they exist even if buffer is OFF
+
     buffer_layers = None
-    buffer_history = []
+    buffer_history: List[np.ndarray] = []
 
     # ===============================
     # ADAPTIVE TIME STEP SETUP ✅
     # ===============================
     if adaptive_timestep:
-        dt_base = dt_min * 60.0
+        dt_base = dt_min * 60.0        # [s]
         dt_tap = max(dt_base / 3, 60.0)
     else:
         dt_base = dt_min * 60.0
         dt_tap = dt_base
 
-    # Pre-allocate safe buffer
+    # Pre-allocate safe max step count
     max_steps = int(sim_hrs * 3600.0 / dt_min) * 2
 
     if buffer_enabled_flag == "On":
-        buffer_layers = np.zeros((max_steps, N_buf))
+        buffer_layers = np.zeros((max_steps, N_buf), dtype=float)
         buffer_layers[0, :] = buffer_temp_init
 
-
-
-        
-# ===============================
+    # ===============================
     # DYNAMIC ARRAY INITIALIZATION ✅
     # ===============================
     time_array = []
@@ -525,16 +536,24 @@ def run_sim(
     Senso_mode_array = []
     Senso_setpoint_array = []
     Tap_active_array = []
-    
+
     # ===============================
     # GEOMETRY SETUP ✅
     # ===============================
-    def mm2_to_m2(x): return x / 1e6
+    def mm2_to_m2(x):
+        return x / 1e6
+
     layer_order = ["Bottom Layer", "Lower-Mid Layer", "Upper-Mid Layer", "Top Layer"]
 
-    V_layers_m3 = np.array([BASE_LAYER_PROPERTIES[n]["Volume_L"] / 1000.0 for n in layer_order])
-    A_ext = np.array([mm2_to_m2(BASE_LAYER_PROPERTIES[n]["Water_External_Surface_mm2"]) for n in layer_order])
-    A_int = np.array([mm2_to_m2(BASE_LAYER_PROPERTIES[n]["Water_Layer_Surface_mm2"]) for n in layer_order])
+    V_layers_m3 = np.array(
+        [BASE_LAYER_PROPERTIES[n]["Volume_L"] / 1000.0 for n in layer_order]
+    )
+    A_ext = np.array(
+        [mm2_to_m2(BASE_LAYER_PROPERTIES[n]["Water_External_Surface_mm2"]) for n in layer_order]
+    )
+    A_int = np.array(
+        [mm2_to_m2(BASE_LAYER_PROPERTIES[n]["Water_Layer_Surface_mm2"]) for n in layer_order]
+    )
 
     m_layer = RHO * V_layers_m3
     UA_loss_layer = Utank * A_ext
@@ -543,7 +562,6 @@ def run_sim(
 
     Pmax_W = P_EL_MAX * Pmax
     Pmin_W = Pmax_W * Pmin
-    Ton = setp - hyst
     coil_bottom_idx = 2
 
     # Initial temperatures
@@ -552,39 +570,32 @@ def run_sim(
     # Legionella cycle tracking
     legionella_cycle_start_time = None
     legionella_in_progress = False
-    
+
     # Simulation time tracking
     tnow_s = 0.0
     sim_end_s = sim_hrs * 3600.0
     step_count = 0
 
-    
-    
-    
- 
-
-    
     # ============================================================
     # MAIN SIMULATION LOOP WITH ADAPTIVE TIME STEPPING
     # ============================================================
     while tnow_s < sim_end_s and step_count < max_steps:
-        # Determine if tapping is occurring in the upcoming time window
         tnow_min = tnow_s / 60.0
         tnow_hrs = tnow_s / 3600.0
-        
+
         # Check for tapping in next base time step
         tap_check_end = tnow_min + (dt_base / 60.0)
         idx_check = np.where((tap_time >= tnow_min) & (tap_time < tap_check_end))[0]
         is_tapping = len(idx_check) > 0
-        
+
         # Select adaptive time step
         if adaptive_timestep and is_tapping:
-            dt_s = dt_tap  # Use fine time step during tapping
+            dt_s = dt_tap
         else:
-            dt_s = dt_base  # Use coarse time step otherwise
-        
+            dt_s = dt_base
+
         dt_current_min = dt_s / 60.0
-        
+
         T_new = T_prev.copy()
         T_top = T_prev[-1]
         T_bottom = T_prev[0]
@@ -594,31 +605,26 @@ def run_sim(
         # ============================================================
         active_setpoint = setp
         current_mode = "Standard"
-        
+
         if senso_enabled:
             hour_of_day = tnow_hrs % 24.0
-            
-            # Holiday mode overrides everything except Legionella
+
             if holiday_mode:
                 active_setpoint = holiday_temp
                 current_mode = "Holiday"
-            # Boost mode - maximum power and increased setpoint
             elif boost_mode:
                 active_setpoint = min(comfort_temp + 5, 65)
                 current_mode = "Boost"
-            # Time program control
             elif enable_time_program:
-                # Check if in comfort period
                 in_morning = morning_start <= hour_of_day < morning_end
                 in_evening = evening_start <= hour_of_day < evening_end
-                
+
                 if in_morning or in_evening:
                     active_setpoint = comfort_temp
                     current_mode = "Comfort"
                 else:
                     active_setpoint = eco_temp
                     current_mode = "ECO"
-            # Fixed mode (no time program)
             elif comfort_mode == "ECO":
                 active_setpoint = eco_temp
                 current_mode = "ECO"
@@ -626,11 +632,9 @@ def run_sim(
                 active_setpoint = comfort_temp
                 current_mode = "Comfort"
             elif comfort_mode == "Auto":
-                # Auto mode uses time program by default
-                hour_of_day = tnow_hrs % 24.0
                 in_morning = morning_start <= hour_of_day < morning_end
                 in_evening = evening_start <= hour_of_day < evening_end
-                
+
                 if in_morning or in_evening:
                     active_setpoint = comfort_temp
                     current_mode = "Auto-Comfort"
@@ -642,60 +646,57 @@ def run_sim(
         # 🦠 LEGIONELLA CYCLE LOGIC (overrides SensoComfort)
         # ============================================================
         legionella_override = False
-        
+
         if legionella_enabled:
             current_day = int(tnow_hrs / 24.0)
             hour_of_day = tnow_hrs % 24.0
-            
-            # Check if it's time to start a new cycle
-            if (current_day % legionella_frequency == 0 and 
-                legionella_start_hour <= hour_of_day < legionella_start_hour + 0.1 and
-                not legionella_in_progress):
+
+            if (
+                current_day % legionella_frequency == 0
+                and legionella_start_hour <= hour_of_day < legionella_start_hour + 0.1
+                and not legionella_in_progress
+            ):
                 legionella_cycle_start_time = tnow_min
                 legionella_in_progress = True
-            
-            # Check if cycle is in progress
+
             if legionella_in_progress:
                 elapsed = tnow_min - legionella_cycle_start_time
                 if elapsed < legionella_duration:
                     legionella_override = True
                 else:
                     legionella_in_progress = False
-        
+
         # ============================================================
-        # HEAT PUMP CONTROL (with Legionella override and SensoComfort)
+        # HEAT PUMP CONTROL
         # ============================================================
         mod = 0.0
         on = False
-        
-        # Use appropriate setpoint based on mode
+
         target_temp = legionella_temp if legionella_override else active_setpoint
         target_hyst = 5.0 if legionella_override else hyst
         Ton = target_temp - target_hyst
-        
-        # Boost mode modifies modulation behavior
+
         boost_factor = 1.5 if (boost_mode and senso_enabled and not legionella_override) else 1.0
-        
+
         if legionella_override:
-            # During Legionella cycle: heat to legionella_temp
             if T_top < target_temp:
                 on = True
                 if T_top <= target_temp - 5.0:
-                    mod = 1.0  # Full power when far from target
+                    mod = 1.0
                 else:
                     raw = (target_temp - T_top) / 5.0
                     mod = max(Pmin, np.clip(raw, 0.0, 1.0))
         else:
-            # Normal operation: heat to active setpoint (may be SensoComfort controlled)
             if T_top < target_temp:
                 on = True
                 if T_top <= Ton:
-                    mod = min(1.0, 1.0 * boost_factor)  # Boost mode increases power
+                    mod = min(1.0, 1.0 * boost_factor)
                 else:
                     raw = (target_temp - T_top) / target_hyst
                     mod = Pmin + (1 - Pmin) * np.clip(raw, 0.0, 1.0)
                     if boost_factor > 1.0:
                         mod = min(1.0, mod * boost_factor)
+
         if mod < Pmin:
             on = False
             mod = 0.0
@@ -710,50 +711,42 @@ def run_sim(
         idx = np.where((tap_time >= tnow_min) & (tap_time < tnow_min + dt_current_min))[0]
         Vtap_L = np.sum(tap_vol[idx]) if idx.size > 0 else 0.0
         tap_rate_current = np.sum(tap_rate[idx]) if idx.size > 0 else 0.0
-        
-        # Calculate actual tap duration within this time step
+
         tap_duration_s = 0.0
         if len(idx) > 0:
-            for i in idx:
-                # Each tap event has a duration based on volume and rate
-                duration = (tap_vol[i] / tap_rate[i]) * 60.0  # seconds
+            for i_idx in idx:
+                duration = (tap_vol[i_idx] / tap_rate[i_idx]) * 60.0
                 tap_duration_s += duration
-        
-        # Mass flow rate during tapping (instantaneous, not averaged)
+
         if tap_duration_s > 0:
             mdot_tap = (Vtap_L / 1000.0) * RHO / tap_duration_s
         else:
             mdot_tap = 0.0
-        
+
         tap_active = tap_duration_s > 0
 
         # ============================================================
         # ENERGY BALANCE FOR EACH LAYER
         # ============================================================
         Q_loss_total = 0.0
-        
+
         for i in range(N_layers):
             Q_net = 0.0
 
-            # Internal heat transfer
             if i > 0:
                 Q_net += UA_int_layer[i] * (T_prev[i - 1] - T_prev[i])
             if i < N_layers - 1:
                 Q_net += UA_int_layer[i] * (T_prev[i + 1] - T_prev[i])
 
-            # External loss
             Q_loss = UA_loss_layer[i] * (T_prev[i] - Tamb)
             Q_net -= Q_loss
             Q_loss_total += Q_loss
 
-            # Heat pump input (bottom layers only)
             if i < coil_bottom_idx and Q > 0:
                 Q_net += Q / coil_bottom_idx
 
-            # Tapping: proportional energy removal based on actual tap duration
             if i == N_layers - 1 and tap_duration_s > 0:
                 Q_tap_out = mdot_tap * C_P * T_prev[i]
-                # Scale by the fraction of time step that tapping occurs
                 tap_fraction = min(tap_duration_s / dt_s, 1.0)
                 Q_net -= Q_tap_out * tap_fraction
             elif i == 0 and tap_duration_s > 0:
@@ -761,27 +754,24 @@ def run_sim(
                 tap_fraction = min(tap_duration_s / dt_s, 1.0)
                 Q_net += Q_tap_in * tap_fraction
 
-            # Temperature update
-            # Temperature update
             dT = Q_net * dt_s / (m_layer[i] * C_P)
             T_new[i] = np.clip(T_prev[i] + dT, 0.0, 100.0)
 
-
-
-                # ============================================================
+        # ============================================================
         # ✅ IMPROVED ANTI-DESTRATIFICATION (GRADUAL MIXING 80/20)
         # ============================================================
         for i in range(N_layers - 1):
-                if T_new[i] > T_new[i + 1]:
-                    T_upper = T_new[i + 1]
-                    T_lower = T_new[i]
-                    T_new[i] = 0.8 * T_lower + 0.2 * T_upper
-                    T_new[i + 1] = 0.2 * T_lower + 0.8 * T_upper
+            if T_new[i] > T_new[i + 1]:
+                T_upper = T_new[i + 1]
+                T_lower = T_new[i]
+                T_new[i] = 0.8 * T_lower + 0.2 * T_upper
+                T_new[i + 1] = 0.2 * T_lower + 0.8 * T_upper
 
 
 
-
-            # Store results in dynamic arrays
+                # ============================
+        # STORE STEP RESULTS
+        # ============================
         time_array.append(tnow_hrs)
         T_array.append(T_new.copy())
         Qhp_array.append(Q)
@@ -797,89 +787,137 @@ def run_sim(
         Senso_setpoint_array.append(active_setpoint)
         Tap_active_array.append(tap_active)
 
-       
+# ===============================
+# ✅ BUFFER UPDATE - ONE PER STEP
+# ===============================
+        if buffer_enabled_flag == "On" and buffer_layers is not None:
+            if step_count == 0:
+        # Save initial state
+             buffer_history.append(buffer_layers[0].copy())
+            elif step_count > 0:
+                buffer_mass = (buffer_volume_L / 1000.0) * BUFFER_RHO
 
-        # Update for next iteration
+                for l in range(N_buf):
+                    Qnet_buf = 0.0
+
+            # Conduction between layers - read from PREVIOUS timestep
+                    if l > 0:
+                        Qnet_buf += 500 * (buffer_layers[step_count-1, l-1] - buffer_layers[step_count-1, l])
+                    if l < N_buf - 1:
+                        Qnet_buf += 500 * (buffer_layers[step_count-1, l+1] - buffer_layers[step_count-1, l])
+
+            # Immersion heater in bottom layer
+                    if l == 0 and immersion_enabled:
+                        Qnet_buf += immersion_power_kw * 1000
+
+            # Boost pump extraction from top layer
+                    if boost_cylinder and l == N_buf - 1:
+                        mdot = (pump_flow_lpm / 60) / 1000 * BUFFER_RHO
+                        Qnet_buf -= mdot * BUFFER_CP * (buffer_layers[step_count-1, -1] - T_prev[0])
+
+            # Calculate new temperature FROM PREVIOUS TIMESTEP
+                    new_temp = buffer_layers[step_count-1, l] + (
+                        Qnet_buf * dt_s / ((buffer_mass / N_buf) * BUFFER_CP)
+            )
+
+            # Store in current timestep
+                    buffer_layers[step_count, l] = np.clip(new_temp, 10, 90)
+
+                buffer_history.append(buffer_layers[step_count].copy())
+
+# Advance time
         T_prev = T_new
         tnow_s += dt_s
         step_count += 1
 
+ 
     # ============================================================
     # CONVERT DYNAMIC ARRAYS TO DATAFRAME
     # ============================================================
     time_h = np.array(time_array)
     T_matrix = np.array(T_array)
-    
-    df = pd.DataFrame({
-    "Time (h)": time_h,
-    "HP Power (W)": Pel_array,
-    "HP Heat (W)": Qhp_array,
-    "COP": COPs_array,
-    "HP_On": HP_on_array,
-    "Modulation": Mod_frac_array,
-    "Tap Flow (L/min)": Tap_flow_array,
-    "Tap Temp (°C)": Tap_temp_array,
-    "Q_Loss (W)": Qloss_total_array,
-    "Legionella_Active": Legionella_active_array,
-    "Senso_Mode": Senso_mode_array,
-    "Senso_Setpoint (°C)": Senso_setpoint_array,
-    "Tap_Active": Tap_active_array,
-})
 
-# ✅ ADD LAYER TEMPERATURE COLUMNS
-    df["T_Bottom Layer (°C)"] = T_matrix[:, 0]
-    df["T_Lower-Mid Layer (°C)"] = T_matrix[:, 1]
-    df["T_Upper-Mid Layer (°C)"] = T_matrix[:, 2]
-    df["T_Top Layer (°C)"] = T_matrix[:, 3]
+    df = pd.DataFrame(
+        {
+            "Time (h)": time_h,
+            "HP Power (W)": Pel_array,
+            "HP Heat (W)": Qhp_array,
+            "COP": COPs_array,
+            "HP_On": HP_on_array,
+            "Modulation": Mod_frac_array,
+            "Tap Flow (L/min)": Tap_flow_array,
+            "Tap Temp (°C)": Tap_temp_array,
+            "Q_Loss (W)": Qloss_total_array,
+            "Legionella_Active": Legionella_active_array,
+            "Senso_Mode": Senso_mode_array,
+            "Senso_Setpoint (°C)": Senso_setpoint_array,
+            "Tap_Active": Tap_active_array,
+        }
+    )
 
-# Optional average
-    df["T_Avg (°C)"] = T_matrix.mean(axis=1)
+    if len(T_matrix) > 0:
+        df["T_Bottom Layer (°C)"] = T_matrix[:, 0]
+        df["T_Lower-Mid Layer (°C)"] = T_matrix[:, 1]
+        df["T_Upper-Mid Layer (°C)"] = T_matrix[:, 2]
+        df["T_Top Layer (°C)"] = T_matrix[:, 3]
+        df["T_Avg (°C)"] = T_matrix.mean(axis=1)
+    else:
+        df["T_Bottom Layer (°C)"] = []
+        df["T_Lower-Mid Layer (°C)"] = []
+        df["T_Upper-Mid Layer (°C)"] = []
+        df["T_Top Layer (°C)"] = []
+        df["T_Avg (°C)"] = []
 
+            # ------------------------------------------
+    # ✅ BUFFER RESULTS → DATAFRAME (if enabled)
+    # ------------------------------------------
+    if buffer_enabled_flag == "On" and buffer_layers is not None and len(time_array) > 0:
+        buf_steps = len(time_array)  # same number of time points as main tank
+        buf_slice = buffer_layers[:buf_steps, :]  # [steps, N_buf]
+
+        # 4 buffer layer temperature series
+        for i in range(N_buf):
+            df[f"Buffer Layer {i+1} (°C)"] = buf_slice[:, i]
+
+        # Average buffer temperature
+        buffer_mass = (buffer_volume_L / 1000.0) * BUFFER_RHO  # [kg]
+        buf_avg = buf_slice.mean(axis=1)  # [°C]
+        df["Buffer Avg Temp (°C)"] = buf_avg
+
+        # Instantaneous buffer energy content vs 0 °C [kWh]
+        df["Buffer Energy (kWh vs 0°C)"] = (
+            buffer_mass * BUFFER_CP * buf_avg / 3.6e6
+        )
+
+        # Buffer pump flow (constant if boost pump enabled)
+        if boost_cylinder and pump_flow_lpm > 0:
+            df["Buffer Pump Flow (L/min)"] = float(pump_flow_lpm)
+        else:
+            df["Buffer Pump Flow (L/min)"] = 0.0
+
+
+ 
 
     # ===============================
-    # 🔥 BUFFER UPDATE (SAFE)
+    # ENERGY INTEGRATION
     # ===============================
-    if buffer_enabled_flag == "On" and buffer_layers is not None and step_count > 0:
-        buffer_mass = (buffer_volume_L / 1000.0) * BUFFER_RHO
+    if len(df) > 1:
+        df["dt_hours"] = df["Time (h)"].diff().fillna(
+            df["Time (h)"].iloc[1] - df["Time (h)"].iloc[0]
+        )
+    else:
+        df["dt_hours"] = 0.0
 
-        for l in range(N_buf):
-            Qnet_buf = 0.0
-
-            if l > 0:
-                Qnet_buf += 15 * (buffer_layers[step_count-1, l-1] - buffer_layers[step_count-1, l])
-            if l < N_buf - 1:
-                Qnet_buf += 15 * (buffer_layers[step_count-1, l+1] - buffer_layers[step_count-1, l])
-
-            if l == 0 and immersion_enabled:
-                Qnet_buf += immersion_power_kw * 1000
-
-            if boost_cylinder and l == N_buf - 1:
-                mdot = (pump_flow_lpm / 60) / 1000 * BUFFER_RHO
-                Qnet_buf -= mdot * BUFFER_CP * (buffer_layers[step_count-1, -1] - T_prev[0])
-
-            new_temp = buffer_layers[step_count-1, l] + (
-                Qnet_buf * dt_s / ((buffer_mass / N_buf) * BUFFER_CP)
-            )
-            buffer_layers[step_count, l] = np.clip(new_temp, 10, 90)
-
-        buffer_history.append(buffer_layers[step_count].copy())
-
-
-
-            # Store results in dynamic arrays
-
-
-
-
-    # Calculate energy with variable time steps
-    df['dt_hours'] = df['Time (h)'].diff().fillna(dt_base / 3600.0)
-    
-    total_heat_kWh = (df["HP Heat (W)"] * df['dt_hours']).sum()
-    total_power_kWh = (df["HP Power (W)"] * df['dt_hours']).sum()
-    total_losses_kWh = (df["Q_Loss (W)"] * df['dt_hours']).sum()
-    hp_runtime_min = (df["HP_On"].astype(float) * df['dt_hours'] * 60).sum()
+    total_heat_kWh = (df["HP Heat (W)"] * df["dt_hours"]).sum() / 1000.0
+    total_power_kWh = (df["HP Power (W)"] * df["dt_hours"]).sum() / 1000.0
+    total_losses_kWh = (df["Q_Loss (W)"] * df["dt_hours"]).sum() / 1000.0
+    hp_runtime_min = (df["HP_On"].astype(float) * df["dt_hours"] * 60.0).sum()
     avg_cop = total_heat_kWh / total_power_kWh if total_power_kWh > 0 else 0.0
-    legionella_runtime_min = (df["Legionella_Active"].astype(float) * df['dt_hours'] * 60).sum() if legionella_enabled else 0
+    legionella_runtime_min = (
+        (df["Legionella_Active"].astype(float) * df["dt_hours"] * 60.0).sum()
+        if legionella_enabled
+        else 0.0
+    )
 
     summary = {
         "Simulation Hours": sim_hrs,
@@ -892,7 +930,23 @@ def run_sim(
         "Legionella Cycle Runtime (minutes)": legionella_runtime_min,
     }
 
+        # Optional: buffer energy change over simulation
+    if buffer_enabled_flag == "On" and buffer_layers is not None and len(time_array) > 1:
+        buf_steps = len(time_array)
+        buf_slice = buffer_layers[:buf_steps, :]
+        buffer_mass = (buffer_volume_L / 1000.0) * BUFFER_RHO
+        buf_avg = buf_slice.mean(axis=1)
+        buf_energy = buffer_mass * BUFFER_CP * buf_avg / 3.6e6  # [kWh vs 0°C]
+
+        buffer_energy_change = buf_energy[-1] - buf_energy[0]
+        summary["Buffer Energy Change (kWh)"] = buffer_energy_change
+        summary["Buffer Start Temp (°C)"] = float(buf_avg[0])
+        summary["Buffer End Temp (°C)"] = float(buf_avg[-1])
+
+
     return df, summary, BASE_LAYER_PROPERTIES
+
+
 
 # ---------- CHARTS ----------
 
@@ -1224,6 +1278,35 @@ def chart_tap(df: pd.DataFrame):
     
     return chart
 
+def chart_buffer_strat(df):
+    """Chart showing buffer tank stratification across 4 layers."""
+    cols = [c for c in df.columns if c.startswith("Buffer Layer")]
+
+    if not cols:
+        return alt.Chart()
+
+    d = df.melt("Time (h)", value_vars=cols, var_name="Layer", value_name="Temp (°C)")
+
+    color_scale = alt.Scale(
+        domain=[f"Buffer Layer {i+1} (°C)" for i in range(4)],
+        range=["#dc2626", "#f97316", "#fbbf24", "#60a5fa"]
+    )
+
+    chart = (
+        alt.Chart(d)
+        .mark_line(strokeWidth=2)
+        .encode(
+            x=alt.X("Time (h):Q", title="Time (hours)"),
+            y=alt.Y("Temp (°C):Q", title="Buffer Temperature (°C)", scale=alt.Scale(zero=False)),
+            color=alt.Color("Layer:N", scale=color_scale)
+        )
+        .properties(height=400, title="Buffer Tank Stratification")
+    )
+
+    return chart
+
+
+
 def chart_legionella(df: pd.DataFrame):
     """Chart showing Legionella cycle activity and top layer temperature."""
     base = alt.Chart(df).encode(x=alt.X("Time (h):Q", title="Time (hours)"))
@@ -1330,17 +1413,41 @@ def chart_tapping_detail(df: pd.DataFrame):
         )
         chart = chart + rule
     
+
+
+    
     return chart
 
-def chart_buffer_strat(df):
-    cols = [c for c in df.columns if "Buffer Layer" in c]
-    d = df.melt("Time (h)", value_vars=cols, var_name="Layer", value_name="Temp (°C)")
+def chart_buffer_pump(df: pd.DataFrame):
+    """Chart showing buffer pump flow over time."""
 
-    return alt.Chart(d).mark_line().encode(
-        x="Time (h)",
-        y="Temp (°C)",
-        color="Layer"
-    ).properties(title="Buffer Stratification")
+    if "Buffer Pump Flow (L/min)" not in df.columns:
+        return alt.Chart()
+
+    chart = (
+        alt.Chart(df)
+        .mark_bar(color="#ef4444")
+        .encode(
+            x=alt.X("Time (h):Q", title="Time (hours)"),
+            y=alt.Y("Buffer Pump Flow (L/min):Q", title="Buffer Pump Flow (L/min)")
+        )
+        .properties(height=250, title="Buffer Pump Flow (L/min)")
+    )
+
+    # Add day markers
+    max_time = df["Time (h)"].max()
+    if max_time > 48:
+        day_lines = pd.DataFrame({
+            "x": [24 * i for i in range(1, int(max_time / 24) + 1)]
+        })
+        rule = (
+            alt.Chart(day_lines)
+            .mark_rule(strokeDash=[4, 4], opacity=0.5)
+            .encode(x="x:Q")
+        )
+        chart = chart + rule
+
+    return chart
 
 
 
@@ -1576,10 +1683,6 @@ def main():
             tap["rate_lpm"].append(e["Flow_lpm"])
 
 
-            #=======================================================
-            # Buffer
-            # ======================================================
-    
     # ==============================================================
     # ⚙️ Simulation Auto-Run Logic
     # ==============================================================
@@ -1611,6 +1714,13 @@ def main():
         "holiday_mode": holiday_mode,
         "holiday_temp": holiday_temp,
         "adaptive_timestep": True,  # Enable adaptive time stepping
+        "buffer_enabled": buffer_enabled == "On",
+        "buffer_volume_L": st.session_state.get("buffer_volume_L", 0),
+        "buffer_temp_init": st.session_state.get("buffer_temp_init", 45),
+        "immersion_enabled": st.session_state.get("immersion_enabled", False),
+        "immersion_power_kw": st.session_state.get("immersion_power_kw", 0.0),
+        "boost_cylinder": st.session_state.get("boost_cylinder", False),
+        "pump_flow_lpm": st.session_state.get("pump_flow_lpm", 0),
     }
     param_key = tuple(params.values())
 
@@ -1624,6 +1734,8 @@ def main():
     if param_changed:
         with st.spinner("🔄 Running simulation..."):
             df, summary, layer_properties = run_sim(
+                # ✅ NEW: buffer system
+                buffer_enabled = st.session_state.get("buffer_enabled") == "On",
                 dt_min=params["dtm"],
                 sim_hrs=params["simh"],
                 Utank=params["Utank"],
@@ -1634,11 +1746,16 @@ def main():
                 Pmax=params["Pmax"],
                 Tsrc=5.0,
                 tap=tap,
+
+
+                ## Legionella
                 legionella_enabled=params["legionella_enabled"],
                 legionella_temp=params["legionella_temp"],
                 legionella_duration=params["legionella_duration"],
                 legionella_frequency=params["legionella_frequency"],
                 legionella_start_hour=params["legionella_start_hour"],
+
+                ## SensoComfort
                 senso_enabled=params["senso_enabled"],
                 comfort_mode=params["comfort_mode"],
                 eco_temp=params["eco_temp"],
@@ -1653,8 +1770,12 @@ def main():
                 holiday_temp=params["holiday_temp"],
                 adaptive_timestep=params["adaptive_timestep"],
                 initial_tank_temp=initial_tank_temp,
+                
 
-            )
+)
+
+
+            
             st.session_state["df"] = df
             st.session_state["summary"] = summary
             st.session_state["layer_properties"] = layer_properties
@@ -1793,8 +1914,10 @@ def main():
         "🔥 Tank Heat Losses (W)",
         "🎛️ SensoComfort Control",
         "🚿 Tapping Detail (Temperature Response)",
-        "Tank Stratification (Multi-Layer)",
         "Buffer Stratification (4-Layer)",
+        "Buffer Pump Flow (L/min)",
+
+        
 
 
 
@@ -1823,9 +1946,6 @@ def main():
             st.altair_chart(chart_legionella(df), use_container_width=True)
         elif choice == "🎛️ SensoComfort Control":
             st.altair_chart(chart_sensocomfort(df), use_container_width=True)
-        elif choice == "Buffer Stratification (4-Layer)":
-            st.altair_chart(chart_buffer_strat(df), use_container_width=True)
-
             
             # Show mode distribution
             if senso_enabled == "On":
@@ -1849,6 +1969,37 @@ def main():
             st.info("🔍 **Adaptive Time Stepping Enabled**: Orange shaded areas show when tapping occurs. "
                    "Notice the rapid temperature drops during tap events - this improved model captures transients "
                    "that were averaged out in the original 5-minute timestep approach!")
+            
+        elif choice == "Buffer Stratification (4-Layer)":
+            # Check if buffer columns exist in dataframe
+            buffer_cols = [c for c in df.columns if c.startswith("Buffer Layer")]
+            if buffer_cols:
+                st.altair_chart(chart_buffer_strat(df), use_container_width=True)
+                # Show buffer configuration info
+                st.info(
+                    f"📊 Buffer Volume: {st.session_state.get('buffer_volume_L', 0)} L | "
+                    f"Initial Temp: {st.session_state.get('buffer_temp_init', 45)}°C | "
+                    f"Immersion: {'ON' if st.session_state.get('immersion_enabled', False) else 'OFF'} "
+                    f"({st.session_state.get('immersion_power_kw', 0)} kW) | "
+                    f"Boost Pump: {'ON' if st.session_state.get('boost_cylinder', False) else 'OFF'} "
+                    f"({st.session_state.get('pump_flow_lpm', 0)} L/min)"
+                )
+            else:
+                st.warning("⚠️ Buffer tank is not enabled. Please enable buffer tank in the sidebar to view this graph.")
+                st.info("💡 **To enable:** Sidebar → 🔥 Buffer Tank → Enable Buffer: **On**")
+
+        elif choice == "Buffer Pump Flow (L/min)":
+                if "Buffer Pump Flow (L/min)" in df.columns:
+                    st.altair_chart(chart_buffer_pump(df), use_container_width=True)
+                    st.info(
+                    f"🧯 Buffer pump is modeled as a constant {st.session_state.get('pump_flow_lpm', 0)} L/min "
+                    f"whenever 'Boost Cylinder via Buffer Pump' is enabled."
+                )
+                else:
+                    st.warning("⚠️ Buffer pump is not enabled or no buffer data is available.")
+                    st.info("💡 Enable buffer tank and boost pump in the sidebar to see this graph.")
+
+
             
      
 
