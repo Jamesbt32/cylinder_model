@@ -27,6 +27,54 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+st.markdown("""
+<style>
+
+/* Fixed collapsible chat shell */
+.chat-shell {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    background: #0f172a;
+    border-top: 2px solid #334155;
+    z-index: 999;
+    box-shadow: 0 -4px 10px rgba(0,0,0,0.3);
+}
+
+/* Header bar */
+.chat-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0.75rem 1rem;
+    cursor: pointer;
+    background: #020617;
+    color: white;
+    font-weight: 600;
+}
+
+/* Expandable body */
+.chat-body {
+    max-height: 0;
+    overflow: hidden;
+    transition: max-height 0.35s ease-in-out;
+    padding: 0 1rem;
+}
+
+/* When expanded */
+.chat-shell.expanded .chat-body {
+    max-height: 400px;
+    padding-bottom: 1rem;
+}
+
+/* Prevent graphs from being hidden */
+.block-container {
+    padding-bottom: 160px !important;
+}
+
+</style>
+""", unsafe_allow_html=True)
 
 # -----------------------------------------------------
 # 🎬 Typewriter Effect
@@ -40,6 +88,9 @@ def typewriter_effect(text: str, speed: float = 0.02):
         placeholder.markdown(displayed_text)
         time.sleep(speed)
     return placeholder
+
+
+summary = st.session_state.get("summary", {})
 
 # -----------------------------------------------------
 # 🤖 Learning Chatbot Feedback + Retraining
@@ -67,6 +118,8 @@ def load_feedback_data():
         return pd.read_csv(FEEDBACK_FILE)
     else:
         return pd.DataFrame(columns=["timestamp", "question", "response", "helpful"])
+    
+    
 
 # --------------------------------------------------------
 # 🔧 Environment setup
@@ -370,7 +423,10 @@ def solve_hp(T_tank: float, mod: float, Pmax_W: float, Pmin_W: float, Pmin_ratio
     return Qhp, Pel, COP
 
 # ---------- SIMULATION ----------
+buffer_layers = None
+buffer_history = []
 @st.cache_data
+# ✅ Always declare buffer_layers so Python knows it exists
 def run_sim(
     dt_min: float,
     sim_hrs: float,
@@ -412,18 +468,49 @@ def run_sim(
     tap_rate = np.array(tap["rate_lpm"])
 
     N_layers = 4
-    
-    # ============================================================
-    # ADAPTIVE TIME STEPPING CONFIGURATION
-    # ============================================================
+
+
+     # ===============================
+    # BUFFER STRATIFICATION SETUP ✅
+    # ===============================
+    N_buf = 4
+    BUFFER_RHO = 1000.0
+    BUFFER_CP = 4186.0
+
+    buffer_enabled_flag = st.session_state.get("buffer_enabled", "Off")
+    buffer_volume_L = st.session_state.get("buffer_volume_L", 0)
+    buffer_temp_init = st.session_state.get("buffer_temp_init", 45)
+    immersion_enabled = st.session_state.get("immersion_enabled", False)
+    immersion_power_kw = st.session_state.get("immersion_power_kw", 0.0)
+    boost_cylinder = st.session_state.get("boost_cylinder", False)
+    pump_flow_lpm = st.session_state.get("pump_flow_lpm", 0)
+    # ✅ Always declare buffer arrays so they exist even if buffer is OFF
+    buffer_layers = None
+    buffer_history = []
+
+    # ===============================
+    # ADAPTIVE TIME STEP SETUP ✅
+    # ===============================
     if adaptive_timestep:
-        dt_base = dt_min * 60.0  # Base time step in seconds
-        dt_tap = max(dt_min * 60.0 / 3, 60.0)  # 1/3 of base or minimum 1 minute
+        dt_base = dt_min * 60.0
+        dt_tap = max(dt_base / 3, 60.0)
     else:
         dt_base = dt_min * 60.0
         dt_tap = dt_base
-    
-    # Dynamic arrays for adaptive timestep
+
+    # Pre-allocate safe buffer
+    max_steps = int(sim_hrs * 3600.0 / dt_min) * 2
+
+    if buffer_enabled_flag == "On":
+        buffer_layers = np.zeros((max_steps, N_buf))
+        buffer_layers[0, :] = buffer_temp_init
+
+
+
+        
+# ===============================
+    # DYNAMIC ARRAY INITIALIZATION ✅
+    # ===============================
     time_array = []
     T_array = []
     Qhp_array = []
@@ -438,7 +525,10 @@ def run_sim(
     Senso_mode_array = []
     Senso_setpoint_array = []
     Tap_active_array = []
-
+    
+    # ===============================
+    # GEOMETRY SETUP ✅
+    # ===============================
     def mm2_to_m2(x): return x / 1e6
     layer_order = ["Bottom Layer", "Lower-Mid Layer", "Upper-Mid Layer", "Top Layer"]
 
@@ -459,7 +549,6 @@ def run_sim(
     # Initial temperatures
     T_prev = np.full(N_layers, initial_tank_temp, dtype=float)
 
-
     # Legionella cycle tracking
     legionella_cycle_start_time = None
     legionella_in_progress = False
@@ -467,9 +556,13 @@ def run_sim(
     # Simulation time tracking
     tnow_s = 0.0
     sim_end_s = sim_hrs * 3600.0
-    
     step_count = 0
-    max_steps = int(sim_hrs * 60.0 * 60.0 / 60.0) * 2  # Safety factor for adaptive steps
+
+    
+    
+    
+ 
+
     
     # ============================================================
     # MAIN SIMULATION LOOP WITH ADAPTIVE TIME STEPPING
@@ -673,18 +766,22 @@ def run_sim(
             dT = Q_net * dt_s / (m_layer[i] * C_P)
             T_new[i] = np.clip(T_prev[i] + dT, 0.0, 100.0)
 
-        # ============================================================
-        # IMPROVED ANTI-DESTRATIFICATION (GRADUAL MIXING 80/20)
+
+
+                # ============================================================
+        # ✅ IMPROVED ANTI-DESTRATIFICATION (GRADUAL MIXING 80/20)
         # ============================================================
         for i in range(N_layers - 1):
-            if T_new[i] > T_new[i + 1]:
-                # Gradual mixing (80/20 blend instead of 50/50)
-                T_upper = T_new[i + 1]
-                T_lower = T_new[i]
-                T_new[i] = 0.8 * T_lower + 0.2 * T_upper
-                T_new[i + 1] = 0.2 * T_lower + 0.8 * T_upper
+                if T_new[i] > T_new[i + 1]:
+                    T_upper = T_new[i + 1]
+                    T_lower = T_new[i]
+                    T_new[i] = 0.8 * T_lower + 0.2 * T_upper
+                    T_new[i + 1] = 0.2 * T_lower + 0.8 * T_upper
 
-        # Store results in dynamic arrays
+
+
+
+            # Store results in dynamic arrays
         time_array.append(tnow_hrs)
         T_array.append(T_new.copy())
         Qhp_array.append(Q)
@@ -699,7 +796,9 @@ def run_sim(
         Senso_mode_array.append(current_mode)
         Senso_setpoint_array.append(active_setpoint)
         Tap_active_array.append(tap_active)
-        
+
+       
+
         # Update for next iteration
         T_prev = T_new
         tnow_s += dt_s
@@ -712,24 +811,65 @@ def run_sim(
     T_matrix = np.array(T_array)
     
     df = pd.DataFrame({
-        "Time (h)": time_h,
-        "HP Power (W)": Pel_array,
-        "HP Heat (W)": Qhp_array,
-        "COP": COPs_array,
-        "HP_On": HP_on_array,
-        "Modulation": Mod_frac_array,
-        "Tap Flow (L/min)": Tap_flow_array,
-        "Tap Temp (°C)": Tap_temp_array,
-        "Q_Loss (W)": Qloss_total_array,
-        "Legionella_Active": Legionella_active_array,
-        "Senso_Mode": Senso_mode_array,
-        "Senso_Setpoint (°C)": Senso_setpoint_array,
-        "Tap_Active": Tap_active_array,
-    })
+    "Time (h)": time_h,
+    "HP Power (W)": Pel_array,
+    "HP Heat (W)": Qhp_array,
+    "COP": COPs_array,
+    "HP_On": HP_on_array,
+    "Modulation": Mod_frac_array,
+    "Tap Flow (L/min)": Tap_flow_array,
+    "Tap Temp (°C)": Tap_temp_array,
+    "Q_Loss (W)": Qloss_total_array,
+    "Legionella_Active": Legionella_active_array,
+    "Senso_Mode": Senso_mode_array,
+    "Senso_Setpoint (°C)": Senso_setpoint_array,
+    "Tap_Active": Tap_active_array,
+})
 
-    for i, name in enumerate(layer_order):
-        df[f"T_{name} (°C)"] = T_matrix[:, i]
+# ✅ ADD LAYER TEMPERATURE COLUMNS
+    df["T_Bottom Layer (°C)"] = T_matrix[:, 0]
+    df["T_Lower-Mid Layer (°C)"] = T_matrix[:, 1]
+    df["T_Upper-Mid Layer (°C)"] = T_matrix[:, 2]
+    df["T_Top Layer (°C)"] = T_matrix[:, 3]
+
+# Optional average
     df["T_Avg (°C)"] = T_matrix.mean(axis=1)
+
+
+    # ===============================
+    # 🔥 BUFFER UPDATE (SAFE)
+    # ===============================
+    if buffer_enabled_flag == "On" and buffer_layers is not None and step_count > 0:
+        buffer_mass = (buffer_volume_L / 1000.0) * BUFFER_RHO
+
+        for l in range(N_buf):
+            Qnet_buf = 0.0
+
+            if l > 0:
+                Qnet_buf += 15 * (buffer_layers[step_count-1, l-1] - buffer_layers[step_count-1, l])
+            if l < N_buf - 1:
+                Qnet_buf += 15 * (buffer_layers[step_count-1, l+1] - buffer_layers[step_count-1, l])
+
+            if l == 0 and immersion_enabled:
+                Qnet_buf += immersion_power_kw * 1000
+
+            if boost_cylinder and l == N_buf - 1:
+                mdot = (pump_flow_lpm / 60) / 1000 * BUFFER_RHO
+                Qnet_buf -= mdot * BUFFER_CP * (buffer_layers[step_count-1, -1] - T_prev[0])
+
+            new_temp = buffer_layers[step_count-1, l] + (
+                Qnet_buf * dt_s / ((buffer_mass / N_buf) * BUFFER_CP)
+            )
+            buffer_layers[step_count, l] = np.clip(new_temp, 10, 90)
+
+        buffer_history.append(buffer_layers[step_count].copy())
+
+
+
+            # Store results in dynamic arrays
+
+
+
 
     # Calculate energy with variable time steps
     df['dt_hours'] = df['Time (h)'].diff().fillna(dt_base / 3600.0)
@@ -1192,17 +1332,16 @@ def chart_tapping_detail(df: pd.DataFrame):
     
     return chart
 
-def chart_tank_temperature(df: pd.DataFrame):
-    chart = (
-        alt.Chart(df)
-        .mark_line(color="#10b981")
-        .encode(
-            x=alt.X("Time (h):Q", title="Time (hours)"),
-            y=alt.Y("T_Avg (°C):Q", title="Average Tank Temperature (°C)")
-        )
-        .properties(height=300, title="Average Tank Temperature Over Time")
-    )
-    return chart
+def chart_buffer_strat(df):
+    cols = [c for c in df.columns if "Buffer Layer" in c]
+    d = df.melt("Time (h)", value_vars=cols, var_name="Layer", value_name="Temp (°C)")
+
+    return alt.Chart(d).mark_line().encode(
+        x="Time (h)",
+        y="Temp (°C)",
+        color="Layer"
+    ).properties(title="Buffer Stratification")
+
 
 
 # ==============================================================
@@ -1214,6 +1353,14 @@ def main():
     # ==============================================================
     with st.sidebar:
         st.header("⚙️ Simulation Parameters")
+        initial_tank_temp = st.slider(
+    "Initial Tank Temperature (°C)",
+    10, 80, 45, 1, key="param_initial_temp"
+)
+        
+
+        # Continue with Knowledge Base section...
+
 
         st.markdown("### Tank and Environment")
         st.write("Tank Volume (L): **150 L (fixed)**")
@@ -1226,14 +1373,6 @@ def main():
             horizontal=True,
             key="sim_period"
         )
-
-        # --- Initial tank temperature (MUST be defined before params dict) ---
-        initial_tank_temp = st.slider(
-        "Initial Tank Temperature (°C)",
-        20, 70, 45, 1,
-        key="param_init_tank_temp"
-)
-
         
         # Set simulation hours based on selection
         if sim_period == "24 Hours":
@@ -1341,6 +1480,24 @@ def main():
             legionella_frequency = 7
             legionella_start_hour = 2
 
+            st.markdown("---")
+        st.markdown("### 🔥 Buffer Tank")
+        
+        buffer_enabled = st.radio(
+            "Enable Buffer",
+            ["Off", "On"],
+            horizontal=True,
+            key="buffer_enabled"
+        )
+        
+        if buffer_enabled == "On":
+            buffer_volume_L = st.slider("Buffer Volume (L)", 50, 500, 150, 10, key="buffer_volume_L")
+            buffer_temp_init = st.slider("Initial Buffer Temp (°C)", 20, 80, 45, key="buffer_temp_init")
+            immersion_enabled = st.checkbox("Enable Immersion Heater", key="immersion_enabled")
+            immersion_power_kw = st.slider("Immersion Power (kW)", 0.0, 10.0, 3.0, key="immersion_power_kw")
+            boost_cylinder = st.checkbox("Boost Cylinder via Buffer Pump", key="boost_cylinder")
+            pump_flow_lpm = st.slider("Pump Flow (L/min)", 2, 30, 12, key="pump_flow_lpm")
+
         st.markdown("---")
         st.markdown("### 📘 Knowledge Base")
         
@@ -1373,6 +1530,8 @@ def main():
             st.success("✅ Knowledge base successfully rebuilt!")
             # Clear the cache to reload
             st.cache_resource.clear()
+
+
 
     # ==============================================================
     # 🚿 Domestic Hot Water Tapping Schedule
@@ -1416,6 +1575,11 @@ def main():
             tap["volume"].append(vol_L)
             tap["rate_lpm"].append(e["Flow_lpm"])
 
+
+            #=======================================================
+            # Buffer
+            # ======================================================
+    
     # ==============================================================
     # ⚙️ Simulation Auto-Run Logic
     # ==============================================================
@@ -1629,7 +1793,12 @@ def main():
         "🔥 Tank Heat Losses (W)",
         "🎛️ SensoComfort Control",
         "🚿 Tapping Detail (Temperature Response)",
-        "🌡️ Tank Temperature (Average)",
+        "Tank Stratification (Multi-Layer)",
+        "Buffer Stratification (4-Layer)",
+
+
+
+
     ],
     key="graph_choice"
 )
@@ -1654,8 +1823,8 @@ def main():
             st.altair_chart(chart_legionella(df), use_container_width=True)
         elif choice == "🎛️ SensoComfort Control":
             st.altair_chart(chart_sensocomfort(df), use_container_width=True)
-        elif choice == "🌡️ Tank Temperature (Average)":
-            st.altair_chart(chart_tank_temperature(df), use_container_width=True)
+        elif choice == "Buffer Stratification (4-Layer)":
+            st.altair_chart(chart_buffer_strat(df), use_container_width=True)
 
             
             # Show mode distribution
@@ -1680,24 +1849,43 @@ def main():
             st.info("🔍 **Adaptive Time Stepping Enabled**: Orange shaded areas show when tapping occurs. "
                    "Notice the rapid temperature drops during tap events - this improved model captures transients "
                    "that were averaged out in the original 5-minute timestep approach!")
+            
+     
+
+# ============================
+# CONSTANTS
+# ============================
+RHO = 1000
+CP = 4186
+
+BUFFER_RHO = 1000
+BUFFER_CP = 4186
+
+P_EL_MAX = 5000
+
+
+
+
+
+
 
         # ==============================================================
         # 💬 AI CHATBOT SECTION (BELOW GRAPHS)
         # ==============================================================
-        st.markdown("---")
-        st.subheader("💬 AI Simulation Assistant")
-        st.caption("Ask things like: *Why does the COP drop during tapping?* or *Explain stratification losses.*")
+st.markdown("---")
+st.subheader("💬 AI Simulation Assistant")
+st.caption("Ask things like: *Why does the COP drop during tapping?* or *Explain stratification losses.*")
 
         # --- User input widgets ---
-        query = st.text_input("Your question:", key="user_question")
+query = st.text_input("Your question:", key="user_question")
 
-        st.markdown("### 🧭 Data Source")
-        data_mode = st.radio(
+st.markdown("### 🧭 Data Source")
+data_mode = st.radio(
             "Choose how the assistant should respond:",
             ["Manual Data (RAG from Vaillant PDF)", "OpenAI General Knowledge"],
-            index=0,
-            horizontal=True,
-            key="radio_data_mode",
+index=0,
+horizontal=True,
+key="radio_data_mode",
         )
 
         # -----------------------------------------------------
@@ -1705,15 +1893,15 @@ def main():
         # -----------------------------------------------------
         
         # Initialize session state for storing responses
-        if 'chatbot_response' not in st.session_state:
+if 'chatbot_response' not in st.session_state:
             st.session_state['chatbot_response'] = None
-        if 'chatbot_query' not in st.session_state:
+if 'chatbot_query' not in st.session_state:
             st.session_state['chatbot_query'] = None
-        if 'retrieved_items' not in st.session_state:
+if 'retrieved_items' not in st.session_state:
             st.session_state['retrieved_items'] = []
         
         # Only run chatbot if query changed
-        if query and query != st.session_state['chatbot_query']:
+if query and query != st.session_state['chatbot_query']:
             api_key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")
             if not api_key:
                 st.warning("⚠️ Please set your OpenAI API key.")
@@ -1740,9 +1928,13 @@ def main():
                             else:
                                 kb_context = "No specific manual context found for this query."
 
+                        layer_properties = st.session_state.get("layer_properties", {})
+
                         geometry_context = "\n".join(
-                            [f"{n}: Vol={p['Volume_L']:.1f} L" for n, p in layer_properties.items()]
-                        )
+    [f"{n}: Vol={p['Volume_L']:.1f} L" for n, p in layer_properties.items()]
+)
+
+                        
                         summary_text = "\n".join([f"{k}: {v}" for k, v in summary.items()])
 
                         prompt = f"""
@@ -1797,7 +1989,7 @@ Please provide a detailed, technical answer based on the information provided ab
                         st.session_state['retrieved_items'] = retrieved_items
         
         # Display stored response if available
-        if st.session_state['chatbot_response'] and query:
+if st.session_state['chatbot_response'] and query:
             best_response = st.session_state['chatbot_response']
             retrieved_items = st.session_state['retrieved_items']
             
@@ -1913,6 +2105,9 @@ Please provide a detailed, technical answer based on the information provided ab
                             )
                             st.altair_chart(chart, use_container_width=True)
                             st.dataframe(feedback_df.sort_values("timestamp", ascending=False))
+
+
+                            
 
 # --- Entry point ---
 if __name__ == "__main__":
