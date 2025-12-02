@@ -27,6 +27,47 @@ from sklearn.linear_model import LogisticRegression
 from datetime import datetime
 import time
 
+from io import BytesIO
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle,
+    Image as RLImage,
+)
+from reportlab.lib.units import cm
+import tempfile
+import io
+from datetime import datetime  # you already import this further down, keep only one
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.utils import ImageReader
+    REPORTLAB_AVAILABLE = True
+except Exception as e:
+    REPORTLAB_AVAILABLE = False
+    print("⚠️ reportlab not available:", e)
+
+try:
+    import altair_saver  # uses vl-convert under the hood
+    ALTAIR_EXPORT_AVAILABLE = True
+except Exception as e:
+    ALTAIR_EXPORT_AVAILABLE = False
+    print("⚠️ altair_saver not available (Altair → PNG export disabled):", e)
+import altair as alt
+alt.data_transformers.disable_max_rows()
+import altair as alt
+
+try:
+    alt.renderers.enable("vl-convert")
+except:
+    alt.renderers.enable("default")
+
+
 alt.data_transformers.disable_max_rows()
 
 
@@ -940,6 +981,11 @@ def run_sim(
     else:
         df["dt_hours"] = 0.0
 
+    # ✅ Always define end time
+    df["Time_end"] = df["Time (h)"] + df["dt_hours"]
+
+
+
     total_heat_kWh = (df["HP Heat (W)"] * df["dt_hours"]).sum() / 1000.0
     total_power_kWh = (df["HP Power (W)"] * df["dt_hours"]).sum() / 1000.0
     total_losses_kWh = (df["Q_Loss (W)"] * df["dt_hours"]).sum() / 1000.0
@@ -979,66 +1025,117 @@ def run_sim(
 
 # ---------- CHARTS ----------
 
-def add_state_shading(df):
+def add_multiline_tooltip(base_chart, df, x_field, y_field, color_field):
     """
-    Creates layered background shading for:
-    - Tap active
-    - Legionella active
-    - SensoComfort modes (Comfort/ECO/Night/etc.)
-    Returns:
-        alt.LayerChart  if there is shading
-        None            if no shading
+    Adds:
+    - Synced global hover line
+    - Tooltip that shows ALL series at the hover point
+    - Cursor marker on all lines
+    - Works with melted (long form) data
     """
+
+    # Bind to global hover selector
+    hover = global_hover
+
+    # Tooltip fields: show one tooltip per row at the hovered x
+    tooltip_fields = [
+        alt.Tooltip(x_field, title="Time (h)"),
+        alt.Tooltip(color_field, title="Series"),
+        alt.Tooltip(y_field, title="Value", format=".2f"),
+    ]
+
+    # Hover points on all lines
+    points = (
+        alt.Chart(df)
+        .mark_circle(size=60, color="black")
+        .encode(
+            x=x_field,
+            y=y_field,
+            tooltip=tooltip_fields,
+            opacity=alt.value(1),
+            color=color_field,
+        )
+        .transform_filter(hover)
+    )
+
+    # Each line is already in base_chart, add rule + points
+    rule = (
+        alt.Chart(df)
+        .mark_rule(color="gray")
+        .encode(x=x_field)
+        .transform_filter(hover)
+    )
+
+    selectors = (
+        alt.Chart(df)
+        .mark_point(opacity=0)
+        .encode(x=x_field)
+        .add_params(hover)
+    )
+
+    return selectors + base_chart + rule + points
+
+
+def add_state_shading(df: pd.DataFrame):
+    """Generate shading rectangles for tap usage, compression, and immersion periods."""
+
     layers = []
 
-    # --- TAPPING (orange) ---
-    tap_df = df[df["Tap_Active"] == True]
-    if len(tap_df) > 0:
-        layers.append(
-            alt.Chart(tap_df)
-            .mark_rect(opacity=0.15, color="#f59e0b")
-            .encode(x="Time (h):Q", x2="Time (h):Q")
-        )
-
-    # --- LEGIONELLA (purple) ---
-    leg_df = df[df["Legionella_Active"] > 0.5]
-    if len(leg_df) > 0:
-        layers.append(
-            alt.Chart(leg_df)
-            .mark_rect(opacity=0.12, color="#8b5cf6")
-            .encode(x="Time (h):Q", x2="Time (h):Q")
-        )
-
-    # --- SensoComfort modes (background colours) ---
-    mode_colors = {
-        "Comfort": "#60a5fa",
-        "Auto-Comfort": "#60a5fa",
-        "ECO": "#4ade80",
-        "Auto-ECO": "#4ade80",
-        "Holiday": "#f9a8d4",
-        "Boost": "#f87171",
-        "Absence": "#a3a3a3",
-        "Night-Eco": "#0f766e",
-        "Night-Normal": "#22c55e",
-        "FrostProt": "#e5e7eb",
-    }
-
-    for mode, color in mode_colors.items():
-        mode_df = df[df["Senso_Mode"] == mode]
-        if len(mode_df) > 0:
+    # --- Tap Active Shading ---
+    if "Tap_Active" in df.columns and "Time_end" in df.columns:
+        tap_df = df[df["Tap_Active"] == True]
+        if not tap_df.empty:
             layers.append(
-                alt.Chart(mode_df)
-                .mark_rect(opacity=0.10, color=color)
-                .encode(x="Time (h):Q", x2="Time (h):Q")
+                alt.Chart(tap_df)
+                .mark_rect(color="#FDBA74", opacity=0.25)
+                .encode(
+                    x="Time (h):Q",
+                    x2="Time_end:Q"
+                )
             )
 
-    if len(layers) == 0:
+    # --- Compression Shading ---
+    if "Compression" in df.columns and "Time_end" in df.columns:
+        comp_df = df[df["Compression"] == True]
+        if not comp_df.empty:
+            layers.append(
+                alt.Chart(comp_df)
+                .mark_rect(color="#93C5FD", opacity=0.20)
+                .encode(
+                    x="Time (h):Q",
+                    x2="Time_end:Q"
+                )
+            )
+
+    # --- Immersion Shading ---
+    if "Immersion_On" in df.columns and "Time_end" in df.columns:
+        imm_df = df[df["Immersion_On"] == True]
+        if not imm_df.empty:
+            layers.append(
+                alt.Chart(imm_df)
+                .mark_rect(color="#FCA5A5", opacity=0.25)
+                .encode(
+                    x="Time (h):Q",
+                    x2="Time_end:Q"
+                )
+            )
+
+
+    if not layers:
         return None
 
     return alt.layer(*layers)
 
 
+
 # GLOBAL shared selection for synced hover across all charts
+global_hover = alt.selection_point(
+    fields=["Time (h)"],
+    nearest=True,
+    on="mousemove",
+    empty=False
+)
+
 global_hover = alt.selection_point(
     fields=["Time (h)"],
     nearest=True,
@@ -1106,37 +1203,45 @@ def chart_tapping_detail(df: pd.DataFrame):
         title="Tapping Detail – Top Layer Temperature vs Tap Flow"
     )
 
-def add_hover_summary(base_chart, df, fields):
+def add_hover_summary(base_chart, df_full, fields, df_plot=None):
     """
     Adds:
-    - Synced hover rule across all charts (using global_hover)
+    - Synced hover rule across charts (global_hover)
     - Multi-field tooltip
     - Cursor point
+    - Background shading (from df_full)
     """
-    # Invisible selector that binds the hover to this chart
+    df_tips = df_full
+    df_pts = df_plot if df_plot is not None else df_full
+
+    # invisible selector to bind hover
     selectors = (
-        alt.Chart(df)
+        alt.Chart(df_pts)
         .mark_point(opacity=0)
         .encode(x="Time (h):Q")
         .add_params(global_hover)
     )
 
-    # Synced vertical rule across charts
     rule = (
-        alt.Chart(df)
+        alt.Chart(df_pts)
         .mark_rule(color="gray")
         .encode(x="Time (h):Q")
         .transform_filter(global_hover)
     )
 
-    # Tooltip+dot
-    tooltip_fields = [
-        alt.Tooltip(col, title=title, format=".2f")
-        for col, title in fields
-    ]
+    # ✅ use df_pts for type checks & existence
+    tooltip_fields = []
+    for col, title in fields:
+        if col not in df_pts.columns:
+            continue  # skip fields not in the actual chart data
+
+        if pd.api.types.is_numeric_dtype(df_pts[col]):
+            tooltip_fields.append(alt.Tooltip(col, title=title, format=".2f"))
+        else:
+            tooltip_fields.append(alt.Tooltip(col, title=title))
 
     points = (
-        alt.Chart(df)
+        alt.Chart(df_pts)
         .mark_circle(size=60, color="black")
         .encode(
             x="Time (h):Q",
@@ -1146,53 +1251,14 @@ def add_hover_summary(base_chart, df, fields):
         .transform_filter(global_hover)
     )
 
-    shading = add_state_shading(df)
+    shading = add_state_shading(df_tips)
 
     if shading is not None:
-        return shading + base_chart + selectors + rule + points
+        return selectors + base_chart + rule + points + shading
     else:
-        return base_chart + selectors + rule + points
+        return selectors + base_chart + rule + points
 
-def add_multiline_tooltip(base_chart, df, x_field, y_field, series_field):
-    """
-    Adds:
-    - multi-line tooltip showing all series at cursor
-    - synchronized hover using global_hover
-    """
 
-    # bind hover event
-    selectors = (
-        alt.Chart(df)
-        .mark_point(opacity=0)
-        .encode(x=x_field)
-        .add_params(global_hover)
-    )
-
-    # vertical rule
-    rule = (
-        alt.Chart(df)
-        .mark_rule(color="gray")
-        .encode(x=x_field)
-        .transform_filter(global_hover)
-    )
-
-    # tooltip with ALL series at that x
-    tooltip_chart = (
-        alt.Chart(df)
-        .mark_circle(size=60, color="black")
-        .encode(
-            x=x_field,
-            y=y_field,
-            tooltip=[
-                alt.Tooltip(x_field, title="Time (h)"),
-                alt.Tooltip(series_field, title="Series"),
-                alt.Tooltip(y_field, title="Value", format=".2f"),
-            ],
-        )
-        .transform_filter(global_hover)
-    )
-
-    return base_chart + selectors + rule + tooltip_chart
 
 
 def chart_soc(df: pd.DataFrame):
@@ -1242,17 +1308,18 @@ def chart_stratification(df: pd.DataFrame):
         range=["#dc2626", "#f97316", "#60a5fa", "#1e3a8a"],
     )
 
-    chart = (
+    base = (
         alt.Chart(d)
-        .mark_line()
+        .mark_line(strokeWidth=2)
         .encode(
             x=alt.X("Time (h):Q", title="Time (hours)", axis=alt.Axis(grid=True)),
             y=alt.Y("Temp (°C):Q", scale=alt.Scale(zero=False)),
             color=alt.Color("Layer:N", scale=color_scale, legend=alt.Legend(title="Tank Layer")),
         )
         .properties(height=400, title="Tank Stratification (4 Layers)")
-        .interactive()
     )
+    
+    chart = add_multiline_tooltip(base, d, "Time (h):Q", "Temp (°C):Q", "Layer:N")
     
     # Add day markers for 7-day view with labels
     max_time = d["Time (h)"].max()
@@ -1280,15 +1347,25 @@ def chart_stratification(df: pd.DataFrame):
     return chart
 
 def chart_power(df: pd.DataFrame):
-    chart = (
+    base = (
         alt.Chart(df)
-        .mark_line(color="#ef4444")
+        .mark_line(color="#ef4444", strokeWidth=2)
         .encode(
-            x=alt.X("Time (h):Q", title="Time (hours)"),
+            x=alt.X("Time (h):Q", title="Time (hours)", axis=alt.Axis(grid=True)),
             y="HP Power (W)"
         )
         .properties(height=300, title="Heat Pump Electrical Power (W)")
     )
+    
+    fields = [
+        ("HP Power (W)", "HP Power (W)"),
+        ("HP Heat (W)", "HP Heat (W)"),
+        ("COP", "COP"),
+        ("T_Top Layer (°C)", "Top Temp (°C)"),
+        ("T_Avg (°C)", "Avg Temp (°C)")
+    ]
+    
+    chart = add_hover_summary(base, df, fields)
     
     # Add day markers for 7-day view
     max_time = df["Time (h)"].max()
@@ -1304,15 +1381,25 @@ def chart_power(df: pd.DataFrame):
     return chart
 
 def chart_heat(df: pd.DataFrame):
-    chart = (
+    base = (
         alt.Chart(df)
-        .mark_line(color="#1d4ed8")
+        .mark_line(color="#1d4ed8", strokeWidth=2)
         .encode(
-            x=alt.X("Time (h):Q", title="Time (hours)"),
+            x=alt.X("Time (h):Q", title="Time (hours)", axis=alt.Axis(grid=True)),
             y="HP Heat (W)"
         )
         .properties(height=300, title="Heat Pump Heat Output (W)")
     )
+    
+    fields = [
+        ("HP Heat (W)", "HP Heat (W)"),
+        ("HP Power (W)", "HP Power (W)"),
+        ("COP", "COP"),
+        ("T_Top Layer (°C)", "Top Temp (°C)"),
+        ("T_Avg (°C)", "Avg Temp (°C)")
+    ]
+    
+    chart = add_hover_summary(base, df, fields)
     
     # Add day markers for 7-day view
     max_time = df["Time (h)"].max()
@@ -1375,7 +1462,8 @@ def chart_tank_losses(df: pd.DataFrame):
         ("HP Heat (W)", "HP Heat (W)")
     ]
 
-    chart = add_hover_summary(base, df, fields)
+    chart = add_hover_summary(base, df, fields,)
+
 
     # Day markers for 2+ days
     max_time = df["Time (h)"].max()
@@ -1394,14 +1482,16 @@ def chart_tank_losses(df: pd.DataFrame):
 
 
 def chart_cop(df: pd.DataFrame):
-    chart = (alt.Chart(df)
-        .mark_line(color="green")
+    base = (
+        alt.Chart(df)
+        .mark_line(color="green", strokeWidth=2)
         .encode(
-            x=alt.X("Time (h):Q", title="Time (hours)"),
+            x=alt.X("Time (h):Q", title="Time (hours)", axis=alt.Axis(grid=True)),
             y="COP"
         )
         .properties(height=300, title="Coefficient of Performance (COP)")
     )
+    
     fields = [
         ("COP", "COP"),
         ("T_Top Layer (°C)", "Top Temp (°C)"),
@@ -1410,7 +1500,7 @@ def chart_cop(df: pd.DataFrame):
         ("HP Heat (W)", "HP Heat (W)")
     ]
     
-    chart = add_hover_summary(chart, df, fields)
+    chart = add_hover_summary(base, df, fields)
     
     # Add day markers for 7-day view
     max_time = df["Time (h)"].max()
@@ -1426,11 +1516,20 @@ def chart_cop(df: pd.DataFrame):
     return chart
 
 def chart_modulation(df: pd.DataFrame):
-    base = alt.Chart(df).encode(x=alt.X("Time (h):Q", title="Time (hours)"))
+    base = alt.Chart(df).encode(x=alt.X("Time (h):Q", title="Time (hours)", axis=alt.Axis(grid=True)))
     mod = base.mark_area(opacity=0.6, color="#2563eb").encode(y="Modulation:Q")
-    hp_on = base.mark_line(color="orange").encode(y="HP_On:Q")
+    hp_on = base.mark_line(color="orange", strokeWidth=2).encode(y="HP_On:Q")
     
-    chart = (mod + hp_on).properties(height=300, title="HP Modulation & On/Off State")
+    combo = mod + hp_on
+    
+    fields = [
+        ("Modulation", "Modulation"),
+        ("HP_On", "HP On/Off"),
+        ("HP Power (W)", "HP Power (W)"),
+        ("T_Top Layer (°C)", "Top Temp (°C)")
+    ]
+    
+    chart = add_hover_summary(combo, df, fields)
     
     # Add day markers for 7-day view
     max_time = df["Time (h)"].max()
@@ -1443,10 +1542,10 @@ def chart_modulation(df: pd.DataFrame):
         )
         chart = chart + rule
     
-    return chart
+    return chart.properties(height=300, title="HP Modulation & On/Off State")
 
 def chart_tap(df: pd.DataFrame):
-    chart = (
+    base = (
         alt.Chart(df)
         .mark_bar(color="#f59e0b")
         .encode(
@@ -1456,6 +1555,14 @@ def chart_tap(df: pd.DataFrame):
         .properties(height=250, title="Tap Flow (L/min)")
     )
     
+    fields = [
+        ("Tap Flow (L/min)", "Tap Flow"),
+        ("Tap Temp (°C)", "Tap Temp"),
+        ("T_Top Layer (°C)", "Top Layer Temp")
+    ]
+    
+    chart = add_hover_summary(base, df, fields)
+    
     # Add day markers for 7-day view
     max_time = df["Time (h)"].max()
     if max_time > 48:
@@ -1469,27 +1576,25 @@ def chart_tap(df: pd.DataFrame):
     
     return chart
 
-def chart_buffer_strat(df: pd.DataFrame):
-    """Line graph of buffer tank stratification (4 layers)."""
-
-    # Pick up the new, nicely named columns
-    cols = [
-        c for c in df.columns
-        if c.startswith("Buffer ") and "Layer" in c
-    ]
-
+def chart_buffer_strat(df):
+    # -----------------------------------------
+    # 1) Select buffer layer columns
+    # -----------------------------------------
+    cols = [c for c in df.columns if c.startswith("Buffer ") and "Layer" in c]
     if not cols:
-        return alt.Chart()
+        return None
 
-    # Wide → long
+    # Melt to long form
     d = df.melt(
         id_vars="Time (h)",
         value_vars=cols,
         var_name="Layer",
-        value_name="Temp (°C)",
+        value_name="Temp (°C)"
     )
 
-    # Colour mapping: must match the *full* column names
+    # -----------------------------------------
+    # 2) Explicit colours for 4 buffer layers
+    # -----------------------------------------
     color_scale = alt.Scale(
         domain=[
             "Buffer Top Layer (°C)",
@@ -1497,30 +1602,73 @@ def chart_buffer_strat(df: pd.DataFrame):
             "Buffer Lower-Mid Layer (°C)",
             "Buffer Bottom Layer (°C)",
         ],
-        range=[
-            "#dc2626",  # top / hot
-            "#f97316",
-            "#60a5fa",
-            "#1e3a8a",  # bottom / cold
-        ],
+        range=["#dc2626", "#f97316", "#60a5fa", "#1e3a8a"],
     )
 
-    chart = (
+    base = (
         alt.Chart(d)
-        .mark_line(interpolate="monotone", strokeWidth=2)
+        .mark_line(strokeWidth=2)
         .encode(
-            x=alt.X("Time (h):Q", title="Time (hours)", axis=alt.Axis(grid=True)),
-            y=alt.Y("Temp (°C):Q", title="Buffer Temperature (°C)", scale=alt.Scale(zero=False)),
-            color=alt.Color("Layer:N", scale=color_scale, title="Buffer Layers"),
+            x="Time (h):Q",
+            y="Temp (°C):Q",
+            color=alt.Color("Layer:N", scale=color_scale),
         )
-        .properties(
-            height=400,
-            title="Buffer Tank Stratification (Line Graph)",
-        )
-        .interactive()
+        .add_params(global_hover)
+        .properties(title="Buffer Stratification (4-Layer)", height=400)
     )
+
+    # --------------------------------------------------------------------
+    # 3) Tooltip fields (only fields that exist in the melted dataframe)
+    # --------------------------------------------------------------------
+    fields = [
+        ("Temp (°C)", "Buffer Temp"),
+        ("Layer", "Layer"),
+    ]
+
+    chart = add_hover_summary(base, df, fields, df_plot=d)
+
+    # ====================================================================
+    # 4) ADD A SINGLE TAP LABEL ON LEFT SIDE (if any tapping occurs)
+    # ====================================================================
+
+    if "Tap_Active" in df.columns and df["Tap_Active"].any():
+
+        # place label at fixed position near max temp
+        ymax = d["Temp (°C)"].max()
+        label_y = ymax + 1
+
+        tap_label_df = pd.DataFrame({
+            "Time (h)": [df["Time (h)"].min()],   # leftmost point only
+            "label": ["Tap"]                      # single label
+        })
+
+        text_layer = (
+            alt.Chart(tap_label_df)
+            .mark_text(
+                align="left",
+                dx=4,
+                dy=-5,
+                fontSize=12,
+                color="#d97706"
+            )
+            .encode(
+                x="Time (h):Q",
+                y=alt.value(label_y),
+                text="label:N"
+            )
+        )
+
+        chart = chart + text_layer
+
 
     return chart
+
+
+
+
+    
+
+
 
 
 def chart_legionella(df: pd.DataFrame):
@@ -1598,7 +1746,7 @@ def chart_buffer_pump(df: pd.DataFrame):
     if "Buffer Pump Flow (L/min)" not in df.columns:
         return alt.Chart()
 
-    chart = (
+    base = (
         alt.Chart(df)
         .mark_bar(color="#ef4444")
         .encode(
@@ -1607,6 +1755,13 @@ def chart_buffer_pump(df: pd.DataFrame):
         )
         .properties(height=250, title="Buffer Pump Flow (L/min)")
     )
+
+    fields = [
+        ("Buffer Pump Flow (L/min)", "Pump Flow"),
+        ("T_Top Layer (°C)", "Top Temp")
+    ]
+    
+    chart = add_hover_summary(base, df, fields)
 
     # Add day markers
     max_time = df["Time (h)"].max()
@@ -1667,10 +1822,13 @@ def chart_buffer_temperature(df: pd.DataFrame):
         y=alt.Y("Buffer Avg Temp (°C):Q", title="Temperature (°C)", scale=alt.Scale(zero=False))
     )
     
-    chart = avg_temp.properties(
-        height=300,
-        title="Buffer Tank Average Temperature"
-    )
+    fields = [
+        ("Buffer Avg Temp (°C)", "Buffer Avg Temp"),
+        ("HP Power (W)", "HP Power"),
+        ("HP Heat (W)", "HP Heat")
+    ]
+    
+    chart = add_hover_summary(avg_temp, df, fields)
     
     # Add day markers for 7-day view
     max_time = df["Time (h)"].max()
@@ -1683,7 +1841,10 @@ def chart_buffer_temperature(df: pd.DataFrame):
         )
         chart = chart + rule
     
-    return chart
+    return chart.properties(
+        height=300,
+        title="Buffer Tank Average Temperature"
+    )
 
 
 def chart_buffer_losses(df: pd.DataFrame):
@@ -2134,6 +2295,8 @@ def main():
 
 }
 
+    # Keep full parameter dict for PDF export
+    st.session_state["last_params_dict"] = params
 
     
     param_key = tuple(params.values())
@@ -2427,10 +2590,17 @@ def main():
                    "that were averaged out in the original 5-minute timestep approach!")
             
         elif choice == "Buffer Stratification (4-Layer)":
-            # Check if buffer columns exist in dataframe
-            buffer_cols = [c for c in df.columns if c.startswith("Buffer ")]
-            if buffer_cols:
+            layer_cols = [
+                c for c in df.columns
+                if c.startswith("Buffer ") and "Layer" in c
+            ]
+
+            if len(layer_cols) < 4:
+                st.warning("⚠️ Buffer tank is not enabled. Please enable buffer tank in the sidebar to view this graph.")
+                st.info("💡 **To enable:** Sidebar → 🔥 Buffer Tank → Enable Buffer: **On**")
+            else:
                 st.altair_chart(chart_buffer_strat(df), use_container_width=True)
+
                 # Show buffer configuration info
                 st.info(
                     f"📊 Buffer Volume: {st.session_state.get('buffer_volume_L', 0)} L | "
@@ -2440,9 +2610,7 @@ def main():
                     f"Boost Pump: {'ON' if st.session_state.get('boost_cylinder', False) else 'OFF'} "
                     f"({st.session_state.get('pump_flow_lpm', 0)} L/min)"
                 )
-            else:
-                st.warning("⚠️ Buffer tank is not enabled. Please enable buffer tank in the sidebar to view this graph.")
-                st.info("💡 **To enable:** Sidebar → 🔥 Buffer Tank → Enable Buffer: **On**")
+
 
         elif choice == "Buffer Pump Flow (L/min)":
                 if "Buffer Pump Flow (L/min)" in df.columns:
@@ -2599,8 +2767,109 @@ def main():
                 f"{stratification_delta:.1f}°C. Good stratification (>5°C) improves hot water availability."
             )
             
-    
+        if "summary" in st.session_state:
+            df = st.session_state["df"]
+            summary = st.session_state["summary"]
+            layer_properties = st.session_state["layer_properties"]
+            ...
+                    # ==============================================================
+        # 📄 Preview & Export PDF Report
+        # ==============================================================
+        st.markdown("---")
+        st.subheader("📄 Preview & Export PDF Report")
 
+        # Pack the parameters we might want to store with the report
+        report_params = {
+            "sim_period": sim_period,
+            "Utank": Utank,
+            "Tamb": Tamb,
+            "dtm": dtm,
+            "setp": setp,
+            "hyst": hyst,
+            "Pmin": Pmin,
+            "Pmax": Pmax,
+            "hp_model_name": hp_model_name,
+        }
+
+        col_pdf_btn, col_pdf_info = st.columns([1, 2])
+        with col_pdf_btn:
+            generate_clicked = st.button("🧾 Generate PDF Report")
+
+        if generate_clicked:
+            try:
+                with st.spinner("📄 Building PDF report (2×2 chart grid)..."):
+                    pdf_bytes = generate_pdf_report(
+                        df=df,
+                        summary=summary,
+                        sim_period=sim_period,
+                        params=report_params,
+                    )
+                st.session_state["report_pdf_bytes"] = pdf_bytes
+                st.success("✅ PDF report generated.")
+            except Exception as e:
+                st.error(f"❌ Failed to generate PDF: {e}")
+
+        if "report_pdf_bytes" in st.session_state:
+            pdf_bytes = st.session_state["report_pdf_bytes"]
+
+            # Preview first page as image (if PyMuPDF available)
+            if FITZ_AVAILABLE:
+                preview_img_bytes = render_pdf_preview_first_page(pdf_bytes)
+                if preview_img_bytes:
+                    st.image(
+                        preview_img_bytes,
+                        caption="PDF Preview – Page 1",
+                        use_column_width=True,
+                    )
+                else:
+                    st.info("Preview not available – unable to render PDF page.")
+            else:
+                st.info("PyMuPDF (fitz) not installed – image preview disabled.")
+
+            # Download button
+            filename = f"Vaillant_150L_Report_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
+            st.download_button(
+                label="⬇️ Download PDF Report",
+                data=pdf_bytes,
+                file_name=filename,
+                mime="application/pdf",
+            )
+        else:
+            with col_pdf_info:
+                st.info(
+                    "Click **“🧾 Generate PDF Report”** to build a multi-page PDF with "
+                    "all key charts (2×2 grid per page) and the simulation summary."
+                )
+
+
+
+        # --------------------------------------
+        # 📄 PDF export – full technical report
+        # --------------------------------------
+        st.markdown("---")
+        st.subheader("📄 Export Full PDF Report")
+
+        # Get latest params dict back
+        params_for_pdf = st.session_state.get("last_params_dict", {})
+        
+        # Generate on demand and cache bytes in session_state
+        if st.button("📄 Generate full PDF report", key="btn_generate_pdf"):
+            pdf_bytes = generate_pdf_report(
+                df=df,
+                summary=summary,
+                params=params_for_pdf,
+                sim_period=sim_period,
+            )
+            st.session_state["pdf_report_bytes"] = pdf_bytes
+            st.success("PDF report generated – scroll down to download ⬇️")
+
+        if "pdf_report_bytes" in st.session_state:
+            st.download_button(
+                "⬇️ Download PDF report",
+                data=st.session_state["pdf_report_bytes"],
+                file_name=f"Vaillant_150L_Report_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+                mime="application/pdf",
+            )
 
             
      
@@ -2616,7 +2885,436 @@ BUFFER_CP = 4186
 
 P_EL_MAX = 5000
 
- 
+def build_pdf_charts(df: pd.DataFrame) -> List[alt.Chart]:
+    """
+    Build the ordered list of charts that will go into the PDF.
+    Each chart will be rendered and packed 4 per page (2×2 grid).
+    """
+    charts: List[alt.Chart] = []
+
+    # Core cylinder charts
+    charts.append(chart_stratification(df))
+    charts.append(chart_tank_temperature(df))
+    charts.append(chart_cop(df))
+    charts.append(chart_power(df))
+    charts.append(chart_heat(df))
+    charts.append(chart_tank_losses(df))
+    charts.append(chart_cylinder_soc(df))
+    charts.append(chart_tap(df))
+
+    # Optional / conditional charts
+    if "Legionella_Active" in df.columns and df["Legionella_Active"].any():
+        leg = chart_legionella(df)
+        if leg is not None:
+            charts.append(leg)
+
+    if "Senso_Setpoint (°C)" in df.columns:
+        charts.append(chart_sensocomfort(df))
+
+    # Buffer charts if buffer enabled
+    if any(c.startswith("Buffer ") for c in df.columns):
+        buf_strat = chart_buffer_strat(df)
+        if buf_strat is not None:
+            charts.append(buf_strat)
+        charts.append(chart_buffer_temperature(df))
+        charts.append(chart_buffer_losses(df))
+        charts.append(chart_soc(df))
+        charts.append(chart_buffer_pump(df))
+        charts.append(chart_mixer_temps(df))
+
+    # Filter out dummy empty charts
+    charts = [ch for ch in charts if isinstance(ch, alt.Chart) or isinstance(ch, alt.LayerChart)]
+
+    return charts
+
+def generate_pdf_report(df: pd.DataFrame,
+                        summary: Dict[str, Any],
+                        sim_period: str,
+                        params: Dict[str, Any]) -> bytes:
+    """
+    Generate a multi-page PDF report with:
+      - Title + summary on page 1
+      - Subsequent pages: 2×2 chart grids (4 charts / page)
+    Returns: PDF as bytes.
+    """
+
+    if not REPORTLAB_AVAILABLE:
+        raise RuntimeError("reportlab is not installed – cannot generate PDF.")
+
+    if not ALTAIR_EXPORT_AVAILABLE:
+        raise RuntimeError("altair_saver is not installed – cannot export charts to PNG.")
+
+    charts = build_pdf_charts(df)
+    if not charts:
+        raise RuntimeError("No charts available to export.")
+
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
+    page_width, page_height = A4
+
+    # ---------- Page 1: Title & summary ----------
+    margin = 40
+    y = page_height - margin
+
+    title = "Vaillant 150 L Cylinder – Simulation Report"
+    c.setFont("Helvetica-Bold", 18)
+    c.drawString(margin, y, title)
+    y -= 30
+
+    c.setFont("Helvetica", 11)
+    c.drawString(margin, y, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    y -= 18
+    c.drawString(margin, y, f"Simulation Period: {sim_period}")
+    y -= 24
+
+    # Summary block
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(margin, y, "Simulation Summary:")
+    y -= 18
+    c.setFont("Helvetica", 10)
+
+    for key, val in summary.items():
+        if isinstance(val, float):
+            text = f"{key}: {val:.3f}"
+        else:
+            text = f"{key}: {val}"
+        c.drawString(margin + 10, y, text)
+        y -= 14
+        if y < 80:  # avoid overflow
+            c.showPage()
+            y = page_height - margin
+            c.setFont("Helvetica", 10)
+
+    c.showPage()
+
+    # ---------- Subsequent pages: 2×2 chart grid ----------
+    # Layout: 2 columns × 2 rows per page
+    cols = 2
+    rows = 2
+    cell_w = (page_width - 2 * margin) / cols
+    cell_h = (page_height - 2 * margin) / rows
+
+    chart_index = 0
+    total_charts = len(charts)
+
+    while chart_index < total_charts:
+        for row in range(rows):
+            for col in range(cols):
+                if chart_index >= total_charts:
+                    break
+
+                chart = charts[chart_index]
+
+                # Export Altair chart to PNG bytes
+                img_buf = io.BytesIO()
+                # Slightly higher scale for better print quality
+                chart.save(img_buf, format="png", scale=2)
+                img_buf.seek(0)
+
+                img = ImageReader(img_buf)
+
+                # Compute position
+                x = margin + col * cell_w
+                # reportlab coords start bottom-left
+                y = margin + (rows - 1 - row) * cell_h
+
+                # Keep aspect ratio – fit within cell
+                c.drawImage(
+                    img,
+                    x,
+                    y,
+                    width=cell_w - 10,
+                    height=cell_h - 10,
+                    preserveAspectRatio=True,
+                    anchor="c",
+                )
+
+                chart_index += 1
+
+        c.showPage()
+
+    c.save()
+    pdf_bytes = buffer.getvalue()
+    buffer.close()
+    return pdf_bytes
+
+def render_pdf_preview_first_page(pdf_bytes: bytes) -> bytes:
+    """
+    Return a PNG image (bytes) of the first page of the given PDF.
+    Requires PyMuPDF (fitz).
+    """
+    if not FITZ_AVAILABLE:
+        return b""
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    if len(doc) == 0:
+        return b""
+
+    page = doc[0]
+    pix = page.get_pixmap()
+    img_bytes = pix.tobytes("png")
+    doc.close()
+    return img_bytes
+
+
+def generate_pdf_report(df: pd.DataFrame,
+                        summary: dict,
+                        params: dict,
+                        sim_period: str) -> bytes:
+    """
+    Build a multi-page PDF report:
+    - Title page
+    - Simulation summary
+    - Input parameters (from sidebar)
+    - Daily breakdown (for 7-day sims)
+    - Key charts (saved via Altair → PNG)
+    Returns bytes ready for st.download_button(data=...).
+    """
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=30,
+        leftMargin=30,
+        topMargin=30,
+        bottomMargin=30,
+    )
+
+    styles = getSampleStyleSheet()
+    style_title = styles["Title"]
+    style_h1 = styles["Heading1"]
+    style_h2 = styles["Heading2"]
+    style_normal = styles["Normal"]
+
+    story = []
+
+    # -----------------------
+    # Title / cover section
+    # -----------------------
+    story.append(Paragraph("Vaillant 150 L Cylinder – Simulation Report", style_title))
+    story.append(Spacer(1, 12))
+    story.append(
+        Paragraph(
+            f"Generated on {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+            style_normal,
+        )
+    )
+    story.append(Spacer(1, 6))
+    story.append(Paragraph(f"Simulation period: {sim_period}", style_normal))
+    story.append(Spacer(1, 24))
+
+    # -----------------------
+    # Simulation summary
+    # -----------------------
+    story.append(Paragraph("Simulation Summary", style_h1))
+    story.append(Spacer(1, 6))
+
+    summary_data = [["Metric", "Value"]]
+    for k, v in summary.items():
+        if isinstance(v, float):
+            val = f"{v:.3f}"
+        else:
+            val = str(v)
+        summary_data.append([k, val])
+
+    summary_table = Table(summary_data, colWidths=[7 * cm, 8 * cm])
+    summary_table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
+                ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ]
+        )
+    )
+    story.append(summary_table)
+    story.append(Spacer(1, 18))
+
+    # -----------------------
+    # Input parameters section
+    # -----------------------
+    story.append(Paragraph("Input Parameters (Sidebar Settings)", style_h1))
+    story.append(Spacer(1, 6))
+
+    if params is None:
+        params = {}
+
+    # Sort keys for stable output
+    param_items = sorted(params.items(), key=lambda x: x[0])
+
+    params_data = [["Parameter", "Value"]]
+    for k, v in param_items:
+        params_data.append([str(k), str(v)])
+
+    params_table = Table(params_data, colWidths=[7 * cm, 8 * cm])
+    params_table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
+                ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ]
+        )
+    )
+    story.append(params_table)
+    story.append(Spacer(1, 24))
+
+    # -----------------------
+    # Daily breakdown (7 days)
+    # -----------------------
+    if sim_period == "7 Days" and "Time (h)" in df.columns:
+        story.append(Paragraph("Daily Energy & Performance Breakdown", style_h1))
+        story.append(Spacer(1, 6))
+
+        max_day = int(df["Time (h)"].max() // 24)
+        daily_rows = [["Day", "Energy (kWh)", "Heat (kWh)", "Losses (kWh)",
+                    "Avg COP", "Tap Vol (L)", "HP Runtime (min)"]]
+
+        total_energy = total_heat = total_losses = 0.0
+        total_tap_vol = 0.0
+        total_runtime = 0.0
+
+        for day in range(max_day + 1):
+            day_mask = (df["Time (h)"] >= day * 24) & (df["Time (h)"] < (day + 1) * 24)
+            day_df = df[day_mask]
+            if day_df.empty:
+                continue
+
+            dt_hours = day_df.get("dt_hours", pd.Series([0] * len(day_df)))
+            energy_kWh = (day_df["HP Power (W)"] * dt_hours).sum() / 1000.0
+            heat_kWh = (day_df["HP Heat (W)"] * dt_hours).sum() / 1000.0
+            losses_kWh = (day_df["Q_Loss (W)"] * dt_hours).sum() / 1000.0
+            tap_vol_L = (day_df["Tap Flow (L/min)"] * (dt_hours * 60)).sum()
+            runtime_min = (day_df["HP_On"] * dt_hours * 60).sum()
+            avg_cop = heat_kWh / energy_kWh if energy_kWh > 0 else 0.0
+
+            total_energy += energy_kWh
+            total_heat += heat_kWh
+            total_losses += losses_kWh
+            total_tap_vol += tap_vol_L
+            total_runtime += runtime_min
+
+            daily_rows.append(
+                [
+                    f"Day {day + 1}",
+                    f"{energy_kWh:.3f}",
+                    f"{heat_kWh:.3f}",
+                    f"{losses_kWh:.3f}",
+                    f"{avg_cop:.2f}",
+                    f"{tap_vol_L:.1f}",
+                    f"{runtime_min:.0f}",
+                ]
+            )
+
+        if total_energy > 0:
+            weekly_cop = total_heat / total_energy
+        else:
+            weekly_cop = 0.0
+
+        daily_rows.append(
+            [
+                "WEEK TOTAL",
+                f"{total_energy:.3f}",
+                f"{total_heat:.3f}",
+                f"{total_losses:.3f}",
+                f"{weekly_cop:.2f}",
+                f"{total_tap_vol:.1f}",
+                f"{total_runtime:.0f}",
+            ]
+        )
+
+        daily_table = Table(daily_rows, colWidths=[2.5 * cm, 2.8 * cm, 2.8 * cm,
+                                                2.8 * cm, 2.2 * cm, 2.8 * cm, 3 * cm])
+        daily_table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
+                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                    ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("BACKGROUND", (0, -1), (-1, -1), colors.whitesmoke),
+                ]
+            )
+        )
+        story.append(daily_table)
+        story.append(Spacer(1, 24))
+
+    # -----------------------
+    # Helper: add Altair chart as PNG
+    # -----------------------
+    def add_chart(title: str, chart):
+        if chart is None:
+            return
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                # Requires kaleido / altair_saver installed
+                chart.save(tmp.name, format="png", scale=2)
+                img = RLImage(tmp.name, width=16 * cm)
+            story.append(Paragraph(title, style_h2))
+            story.append(Spacer(1, 6))
+            story.append(img)
+            story.append(Spacer(1, 18))
+        except Exception as e:
+            # Fall back to text if rendering fails
+            story.append(
+                Paragraph(f"{title} (chart could not be rendered: {e})", style_normal)
+            )
+            story.append(Spacer(1, 12))
+
+    # -----------------------
+    # Key charts pages
+    # -----------------------
+    # 1. COP
+    add_chart("Coefficient of Performance (COP)", chart_cop(df))
+
+    # 2. Cylinder Stratification
+    add_chart("Cylinder Stratification (Multi-Layer)", chart_stratification(df))
+
+    # 3. Power & Heat
+    add_chart("Heat Pump Electrical Power (W)", chart_power(df))
+    add_chart("Heat Pump Heat Output (W)", chart_heat(df))
+
+    # 4. Cylinder temperatures & losses
+    add_chart("Cylinder Average Temperature vs Setpoint", chart_tank_temperature(df))
+    add_chart("Cylinder Heat Losses (W)", chart_tank_losses(df))
+
+    # 5. Modulation & tapping
+    add_chart("HP Modulation & On/Off State", chart_modulation(df))
+    add_chart("Tap Flow (L/min)", chart_tap(df))
+
+    # 6. SOC & buffers (if available)
+    add_chart("Cylinder State of Charge", chart_cylinder_soc(df))
+
+    if "Buffer Avg Temp (°C)" in df.columns:
+        # These chart_* functions are already defined in your code
+        add_chart("Buffer Stratification (4-Layer)", chart_buffer_strat(df))
+        add_chart("Buffer State of Charge (HP vs Immersion)", chart_soc(df))
+        add_chart("Buffer Tank Average Temperature", chart_buffer_temperature(df))
+        add_chart("Buffer Tank Heat Losses (W)", chart_buffer_losses(df))
+
+    # 7. Legionella & SensoComfort (if enabled)
+    if "Legionella_Active" in df.columns:
+        leg_chart = chart_legionella(df)
+        if leg_chart is not None:
+            add_chart("Legionella Cycle Activity", leg_chart)
+
+    add_chart("SensoComfort Control: Temperature vs Setpoint", chart_sensocomfort(df))
+
+    # -----------------------
+    # Build PDF
+    # -----------------------
+    doc.build(story)
+    pdf_bytes = buffer.getvalue()
+    buffer.close()
+    return pdf_bytes
+
+
+
 
 
                             
