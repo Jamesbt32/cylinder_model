@@ -1,4 +1,4 @@
-﻿altair==5.5.0
+altair>=5.2.0
 attrs==25.3.0
 beautifulsoup4==4.13.5
 blinker==1.9.0
@@ -61,9 +61,11 @@ tqdm==4.66.5
 typing_extensions==4.15.0
 tzdata==2025.2
 urllib3==2.5.0
+vl-convert-python>=1.7.0
 watchdog==6.0.0
 websockets==15.0.1
 yfinance==0.2.66
+
 
 
 
