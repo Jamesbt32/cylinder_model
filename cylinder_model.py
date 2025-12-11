@@ -482,12 +482,58 @@ def run_sim(
     U_int = 50.0                               # W/m²K (internal vertical exchange)
     UA_int_layer = U_int * A_int               # W/K
 
-    # Heat pump electrical limits
-    Pmax_W = P_EL_MAX * Pmax
-    Pmin_W = Pmax_W * Pmin
+    layer_order = ["Bottom Layer", "Lower-Mid Layer", "Upper-Mid Layer", "Top Layer"]
 
-    # Coil layer index (0=bottom, 3=top)
-    coil_bottom_idx = 2
+    V_layers_m3 = np.array(
+        [BASE_LAYER_PROPERTIES[n]["Volume_L"] / 1000.0 for n in layer_order]
+    )
+    A_ext = np.array(
+        [mm2_to_m2(BASE_LAYER_PROPERTIES[n]["Water_External_Surface_mm2"]) for n in layer_order]
+    )
+    A_int = np.array(
+        [mm2_to_m2(BASE_LAYER_PROPERTIES[n]["Water_Layer_Surface_mm2"]) for n in layer_order]
+    )
+
+    m_layer = RHO * V_layers_m3                # kg
+    UA_loss_layer = Utank * A_ext              # W/K
+    U_int = 50.0                               # W/m²K (internal vertical exchange)
+    UA_int_layer = U_int * A_int               # W/K
+
+    # === Stratification-aware mapping of real ports to layers ===
+    layer_fracs = V_layers_m3 / V_layers_m3.sum()
+    boundaries = np.concatenate(([0.0], np.cumsum(layer_fracs)))  # 0..1
+
+    def height_to_layer_index(z_mm, H_tot_mm=1000.0):
+        """Return the layer index [0..N_layers-1] containing a port at height z (mm)."""
+        z_frac = z_mm / H_tot_mm
+        return int(np.clip(np.searchsorted(boundaries, z_frac, side="right") - 1,
+                           0, N_layers - 1))
+
+    # === Vaillant 150 L uniSTOR ports (approx, mm from bottom) ===
+    Z_DHW_OUTLET   = 675.0  # port 7
+    Z_COIL_TOP     = 520.0  # port 2: HP heating flow
+    Z_COIL_BOTTOM  = 393.0  # port 1/5: HP return
+    Z_COLD_INLET   = 154.0  # cold feed/drain region
+
+    # Map heights to layer indices
+    layer_cold_in   = height_to_layer_index(Z_COLD_INLET)
+    layer_dhw_out   = height_to_layer_index(Z_DHW_OUTLET)
+    layer_coil_low  = height_to_layer_index(Z_COIL_BOTTOM)
+    layer_coil_high = height_to_layer_index(Z_COIL_TOP)
+
+    # All layers spanned by the coil
+    coil_layers = np.arange(layer_coil_low, layer_coil_high + 1, dtype=int)
+    # Representative layer for COP sink temperature (use upper part of coil)
+    coil_sink_layer = int(coil_layers[-1])
+
+
+
+    # === Vaillant 150 L uniSTOR ports (approx) ===
+    Z_DHW_OUTLET   = 675.0  # mm  (port 7)
+    Z_COIL_TOP     = 520.0  # mm  (port 2: heating flow from HP)
+    Z_COIL_BOTTOM  = 393.0  # mm  (port 1 or 5: cylinder heating return/inlet)
+    Z_COLD_INLET   = 154.0  # mm  (bottom cold feed / drain region, from drawing
+
 
     # ===============================
     # BUFFER SETUP (simplified 4-layer)
@@ -710,12 +756,10 @@ def run_sim(
         else:
             mod = 0.0
 
-        # ---------------------------------
-        # DETERMINE HP SINK / SOURCE TEMPS
-        # ---------------------------------
-        # Default: HP sink flow based on coil layer + 5 K
-        T_flow_for_COP = float(T_prev[coil_bottom_idx] + 5.0)
+        # Default: HP sink flow based on upper coil layer + 5 K
+        T_flow_for_COP = float(T_prev[coil_sink_layer] + 5.0)
         T_source_for_HP = float(Tsrc)
+
 
         # ---------------------------------
         # CALL aroTHERM HP MODEL
@@ -754,36 +798,35 @@ def run_sim(
             Q_net -= Q_loss
             Q_loss_total += Q_loss
 
-            # HP injection into coil layer (if no complex buffer coupling active)
-            if hp_on and i == coil_bottom_idx:
-                Q_net += Q_hp
+            # HP injection into all layers spanned by the coil
+            if hp_on and i in coil_layers and Q_hp > 0:
+                Q_net += Q_hp / len(coil_layers)
 
-            # Tapping: hot out at top layer
-            if tap_active and i == N_layers - 1 and mdot_tap > 0:
+
+            # hot draw-off at DHW outlet height
+            if tap_active and i == layer_dhw_out and mdot_tap > 0:
                 tap_fraction = min(tap_duration_s / dt_s, 1.0)
                 Q_tap_out = mdot_tap * C_P * T_prev[i]
                 Q_net -= Q_tap_out * tap_fraction
 
-            # Tapping: cold in at bottom layer
-            if tap_active and i == 0 and mdot_tap > 0:
+            # cold feed into cold inlet height
+            if tap_active and i == layer_cold_in and mdot_tap > 0:
                 tap_fraction = min(tap_duration_s / dt_s, 1.0)
-                # Using Tamb as mains temperature placeholder
-                Q_tap_in = mdot_tap * C_P * Tamb
+                Q_tap_in = mdot_tap * C_P * Tamb  # or mains_T if you model it separately
                 Q_net += Q_tap_in * tap_fraction
+
 
             # Update layer temperature
             dT = Q_net * dt_s / (m_layer[i] * C_P)
             T_new[i] = np.clip(T_prev[i] + dT, 0.0, 100.0)
 
-        # ---------------------------------
-        # ANTI-DESTRATIFICATION MIXING
-        # ---------------------------------
-        for i in range(N_layers - 1):
-            if T_new[i] > T_new[i + 1]:
-                T_lower = T_new[i]
-                T_upper = T_new[i + 1]
-                T_new[i] = 0.8 * T_lower + 0.2 * T_upper
-                T_new[i + 1] = 0.2 * T_lower + 0.8 * T_upper
+            # ---------------------------------
+            # BUOYANCY / STRATIFICATION REORDERING
+            # ---------------------------------
+            # Enforce physically stable stratification:
+            # coldest at bottom (index 0), hottest at top (index N_layers-1)
+            T_new = np.sort(T_new)
+
 
         # ---------------------------------
         # SIMPLE BUFFER MODEL (OPTIONAL)
@@ -877,6 +920,10 @@ def run_sim(
     # ===============================
     # BUILD DATAFRAME
     # ===============================
+    print(f"🔍 Debug: T_array length = {len(T_array)}")
+    if len(T_array) > 0:
+        print(f"🔍 Debug: First T_array element = {T_array[0]}")
+        print(f"🔍 Debug: T_array[0] shape = {np.array(T_array[0]).shape}")
     time_h = np.array(time_array)
     T_matrix = np.array(T_array) if len(T_array) > 0 else np.zeros((0, N_layers))
 
@@ -1292,22 +1339,73 @@ def chart_soc(df: pd.DataFrame):
 
 
 def chart_stratification(df: pd.DataFrame):
-    cols = [c for c in df.columns if c.startswith("T_") and "Avg" not in c]
-    d = df.melt("Time (h)", value_vars=cols, var_name="Layer", value_name="Temp (°C)")
-
-    label_map = {
-        "T_Bottom Layer (°C)": "Bottom Layer",
-        "T_Lower-Mid Layer (°C)": "Lower-Mid Layer",
-        "T_Upper-Mid Layer (°C)": "Upper-Mid Layer",
-        "T_Top Layer (°C)": "Top Layer",
-    }
-    d["Layer"] = d["Layer"].map(label_map)
-
+    """
+    Plot 4-layer cylinder stratification with comprehensive error handling.
+    """
+    # 🔍 Debug: 
+    st.write("**Debug - Looking for stratification columns...**")
+    st.write(f"Total columns in df: {len(df.columns)}")
+    
+    # Define expected column names (exact match)
+    expected_cols = [
+        "T_Bottom Layer (°C)",
+        "T_Lower-Mid Layer (°C)",
+        "T_Upper-Mid Layer (°C)",
+        "T_Top Layer (°C)"
+    ]
+    
+    # Check which columns actually exist
+    cols = [c for c in expected_cols if c in df.columns]
+    st.write(f"Found {len(cols)} of 4 expected columns: {cols}")
+    
+    if not cols:
+        # Fallback: try to find ANY layer columns
+        cols = [c for c in df.columns if c.startswith("T_") and "Layer" in c and "Avg" not in c]
+        st.write(f"Fallback search found: {cols}")
+    
+    if not cols:
+        st.error("⚠️ No stratification data available")
+        st.info("**Possible causes:**\n"
+                "1. Simulation may not have run successfully\n"
+                "2. Layer temperature data wasn't created\n"
+                "3. Column names don't match expected format")
+        return alt.Chart()
+    
+    # Check if columns have data
+    for col in cols:
+        if df[col].isna().all():
+            st.warning(f"⚠️ Column '{col}' exists but contains only NaN values")
+        elif len(df[col]) == 0:
+            st.warning(f"⚠️ Column '{col}' exists but is empty")
+    
+    # Melt to long form
+    try:
+        d = df.melt("Time (h)", value_vars=cols, var_name="Layer", value_name="Temp (°C)")
+        st.write(f"Melted dataframe shape: {d.shape}")
+    except Exception as e:
+        st.error(f"❌ Error melting dataframe: {e}")
+        return alt.Chart()
+    
+    # Check for valid data
+    if d["Temp (°C)"].isna().all():
+        st.error("❌ All temperature values are NaN")
+        return alt.Chart()
+    
+    if len(d) == 0:
+        st.error("❌ Melted dataframe is empty")
+        return alt.Chart()
+    
+    # Color scale mapping
     color_scale = alt.Scale(
-        domain=["Top Layer", "Upper-Mid Layer", "Lower-Mid Layer", "Bottom Layer"],
+        domain=[
+            "T_Top Layer (°C)",
+            "T_Upper-Mid Layer (°C)",
+            "T_Lower-Mid Layer (°C)",
+            "T_Bottom Layer (°C)",
+        ],
         range=["#dc2626", "#f97316", "#60a5fa", "#1e3a8a"],
     )
-
+    
     base = (
         alt.Chart(d)
         .mark_line(strokeWidth=2)
@@ -1320,27 +1418,24 @@ def chart_stratification(df: pd.DataFrame):
     )
     
     chart = add_multiline_tooltip(base, d, "Time (h):Q", "Temp (°C):Q", "Layer:N")
+
+    
     
     # Add day markers for 7-day view with labels
     max_time = d["Time (h)"].max()
-    if max_time > 48:  # If more than 2 days, add day separators
+    if max_time > 48:
         day_data = pd.DataFrame({
             'x': [24 * i for i in range(0, int(max_time / 24) + 1)],
             'label': [f'Day {i+1}' for i in range(int(max_time / 24) + 1)]
         })
         
-        # Vertical day lines
-        rule = alt.Chart(day_data).mark_rule(strokeDash=[4, 4], color='gray', opacity=0.5).encode(
-            x='x:Q'
-        )
+        rule = alt.Chart(day_data).mark_rule(
+            strokeDash=[4, 4], color='gray', opacity=0.5
+        ).encode(x='x:Q')
         
-        # Day labels at top
         text = alt.Chart(day_data[day_data['x'] < max_time]).mark_text(
             align='left', dx=5, dy=-180, fontSize=10, color='gray'
-        ).encode(
-            x='x:Q',
-            text='label:N'
-        )
+        ).encode(x='x:Q', text='label:N')
         
         chart = chart + rule + text
     
@@ -1577,24 +1672,37 @@ def chart_tap(df: pd.DataFrame):
     return chart
 
 def chart_buffer_strat(df):
-    # -----------------------------------------
-    # 1) Select buffer layer columns
-    # -----------------------------------------
-    cols = [c for c in df.columns if c.startswith("Buffer ") and "Layer" in c]
-    if not cols:
+    """Buffer stratification - WITH SAFETY CHECKS."""
+    # Check for buffer columns
+    layer_cols = [c for c in df.columns if c.startswith("Buffer ") and "Layer" in c]
+    
+    if not layer_cols or len(layer_cols) < 4:
+        print("⚠️ No buffer layer data")
+        return None  # Return None instead of empty chart!
+    
+    try:
+        # Melt data
+        d = df.melt(
+            id_vars="Time (h)",
+            value_vars=layer_cols,
+            var_name="Layer",
+            value_name="Temp (°C)"
+        )
+        
+        # CHECK: Do we have actual data?
+        if d.empty or len(d) == 0:
+            print("⚠️ Buffer data melted to empty")
+            return None
+        
+        if d["Temp (°C)"].isna().all():
+            print("⚠️ All buffer temps are NaN")
+            return None
+        
+    except Exception as e:
+        print(f"⚠️ Buffer melt failed: {e}")
         return None
-
-    # Melt to long form
-    d = df.melt(
-        id_vars="Time (h)",
-        value_vars=cols,
-        var_name="Layer",
-        value_name="Temp (°C)"
-    )
-
-    # -----------------------------------------
-    # 2) Explicit colours for 4 buffer layers
-    # -----------------------------------------
+    
+    # Color scale
     color_scale = alt.Scale(
         domain=[
             "Buffer Top Layer (°C)",
@@ -1604,7 +1712,8 @@ def chart_buffer_strat(df):
         ],
         range=["#dc2626", "#f97316", "#60a5fa", "#1e3a8a"],
     )
-
+    
+    # Build chart
     base = (
         alt.Chart(d)
         .mark_line(strokeWidth=2)
@@ -1613,9 +1722,18 @@ def chart_buffer_strat(df):
             y="Temp (°C):Q",
             color=alt.Color("Layer:N", scale=color_scale),
         )
-        .add_params(global_hover)
         .properties(title="Buffer Stratification (4-Layer)", height=400)
     )
+    
+    # Add interactions
+    try:
+        fields = [("Temp (°C)", "Buffer Temp"), ("Layer", "Layer")]
+        chart = add_hover_summary(base, df, fields, df_plot=d)
+    except:
+        # If hover fails, return base chart
+        chart = base
+    
+    return chart
 
     # --------------------------------------------------------------------
     # 3) Tooltip fields (only fields that exist in the melted dataframe)
@@ -1937,23 +2055,94 @@ def chart_cylinder_soc(df: pd.DataFrame):
 # MAIN APPLICATION
 # ==============================================================
 def main():
-    # ==============================================================
-    # 🧩 SIDEBAR — Simulation Parameters
-    # ==============================================================
     with st.sidebar:
         st.header("⚙️ Simulation Parameters")
 
+        # ==============================================================
+        # 🔥 HEAT PUMP CONTROL (MOVED TO TOP)
+        # ==============================================================
+        st.markdown("### 🔥 Heat Pump Control")
+        
+        # Heat Pump Model Selection
+        hp_model_name = st.selectbox(
+            "Heat Pump Model",
+            ["3.5 kW", "5 kW", "7 kW", "10 kW", "12 kW"],
+            index=2,
+            key="hp_model"
+        )
+        
+        # Setpoint Temperatures (NEW - Split into Heating and DHW)
+        col1, col2 = st.columns(2)
+        with col1:
+            heating_setp = st.slider(
+                "Heating Setpoint (°C)", 
+                30, 65, 45, 1, 
+                key="heating_setp",
+                help="Target temperature for space heating circuit"
+            )
+        with col2:
+            dhw_setp = st.slider(
+                "DHW Setpoint (°C)", 
+                40, 90, 50, 1, 
+                key="dhw_setp",
+                help="Target temperature for domestic hot water cylinder"
+            )
+        
+        # Control Parameters
+        hyst = st.slider(
+            "Hysteresis (°C)", 
+            1.0, 10.0, 5.0, 0.5, 
+            key="param_hyst",
+            help="Temperature band for HP on/off switching"
+        )
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            Pmax = st.slider(
+                "Max Power Ratio", 
+                0.5, 1.0, 1.0, 0.05, 
+                key="param_pmax",
+                help="Maximum HP output capacity"
+            )
+        with col2:
+            Pmin = st.slider(
+                "Min Modulation", 
+                0.1, 0.5, 0.2, 0.05, 
+                key="param_pmin",
+                help="Minimum modulation level"
+            )
+        
+        # Operating Modes
+        col1, col2 = st.columns(2)
+        with col1:
+            quiet_mode_enabled = st.checkbox(
+                "Quiet Mode", 
+                value=False,
+                help="Reduces noise but slightly decreases efficiency"
+            )
+        with col2:
+            defrost_enabled = st.checkbox(
+                "Enable Defrost", 
+                value=True,
+                help="Automatic defrost cycle in cold conditions"
+            )
 
-        # --- Initial Tank Temp ---
+        # ==============================================================
+        # 🏠 TANK AND ENVIRONMENT
+        # ==============================================================
+        st.markdown("---")
+        st.markdown("### 🏠 Tank and Environment")
+        
+        st.write("Tank Volume (L): **150 L (fixed)**")
+        
+        # Initial Tank Temperature
         initial_tank_temp = st.slider(
             "Initial Tank Temperature (°C)",
-            10, 80, 45, 1
+            10, 80, 45, 1,
+            key="initial_tank_temp"
         )
 
-        # --- Simulation Period ---
-        st.markdown("### Tank and Environment")
-        st.write("Tank Volume (L): **150 L (fixed)**")
-
+        # Simulation Period
         sim_period = st.radio(
             "Simulation Period",
             ["24 Hours", "7 Days"],
@@ -1969,32 +2158,31 @@ def main():
             simh = 168
             st.info("📊 Viewing: 7-day weekly pattern")
 
-        # --- Tank + Environment ---
-        Utank = st.slider("Tank U-value (W/m²K)", 0.1, 2.0, 0.4, 0.1)
-        Tamb = st.slider("Ambient Temp (°C)", 0, 30, 15, key="param_tamb")
-        dtm = st.slider("Time Step (min)", 1, 10, 5, key="param_dtm")
-
-        # --- Heat Pump ---
-        st.markdown("### Heat Pump Control")
-        setp = st.slider("Setpoint (°C)", 40, 90, 50, 1, key="param_setp")
-        hyst = st.slider("Hysteresis (°C)", 1.0, 10.0, 5.0, 0.5, key="param_hyst")
-        Pmax = st.slider("Max HP Power Ratio", 0.5, 1.0, 1.0, 0.05, key="param_pmax")
-        Pmin = st.slider("Min Modulation Ratio", 0.1, 0.5, 0.2, 0.05, key="param_pmin")
-
-        st.markdown("### aroTHERM Model Selection")
-        hp_model_name = st.selectbox(
-            "Heat Pump Model",
-            ["3.5 kW", "5 kW", "7 kW", "10 kW", "12 kW"],
-            index=2
+        # Environment Parameters
+        col1, col2 = st.columns(2)
+        with col1:
+            Utank = st.slider(
+                "Tank U-value (W/m²K)", 
+                0.1, 2.0, 0.4, 0.1,
+                key="utank"
+            )
+        with col2:
+            Tamb = st.slider(
+                "Ambient Temp (°C)", 
+                0, 30, 15, 
+                key="param_tamb"
+            )
+        
+        dtm = st.slider(
+            "Time Step (min)", 
+            1, 10, 5, 
+            key="param_dtm",
+            help="Simulation time resolution"
         )
 
-        quiet_mode_enabled = st.checkbox("Quiet Mode", value=False)
-        defrost_enabled = st.checkbox("Enable Defrost", value=True)
-
-
-               # =========================
-        # SensoComfort Controls
-        # =========================
+        # ==============================================================
+        # 🎛️ SENSOCOMFORT CONTROLS
+        # ==============================================================
         st.markdown("---")
         st.markdown("### 🎛️ SensoComfort Controls")
 
@@ -2114,9 +2302,9 @@ def main():
             frost_protection_enabled = True
             frost_protection_temp = 5.0
 
-        # =========================
-        # Legionella
-        # =========================
+        # ==============================================================
+        # 🦠 LEGIONELLA PROTECTION
+        # ==============================================================
         st.markdown("---")
         st.markdown("### 🦠 Legionella Protection")
 
@@ -2138,9 +2326,9 @@ def main():
             legionella_frequency = 7
             legionella_start_hour = 2
 
-        # =========================
-        # Buffer Tank
-        # =========================
+        # ==============================================================
+        # 🔥 BUFFER TANK
+        # ==============================================================
         st.markdown("---")
         st.markdown("### 🔥 Buffer Tank")
 
@@ -2192,9 +2380,6 @@ def main():
             flow_temp_before_mixer = 60
             flow_temp_after_mixer = 45
             heating_circuit_flow_lpm = 20
-
-
-        
 
        
 
@@ -2251,7 +2436,8 @@ def main():
         "simh": simh,
         "Utank": Utank,
         "Tamb": Tamb,
-        "setp": setp,
+        "dhw_setp": dhw_setp,          
+        "heating_setp": heating_setp,
         "hyst": hyst,
         "Pmin": Pmin,
         "Pmax": Pmax,
@@ -2315,7 +2501,7 @@ def main():
                 sim_hrs=params["simh"],
                 Utank=params["Utank"],
                 Tamb=params["Tamb"],
-                setp=params["setp"],
+                setp=params["dhw_setp"],
                 hyst=params["hyst"],
                 Pmin=params["Pmin"],
                 Pmax=params["Pmax"],
@@ -2372,7 +2558,9 @@ def main():
         st.session_state["last_params"] = param_key
         st.session_state["ai_paused"] = True
 
-    st.success("✅ Simulation complete!")
+ 
+
+    
 
     # ==============================================================
     # 📊 Simulation Results + Graphs
@@ -2498,18 +2686,18 @@ def main():
         "Heat Pump Heat Output (W)",
         "HP Modulation & On/Off State",
         "Tap Flow (L/min)",
-        "🦠 Legionella Cycle Activity",
-        "📊 Cylinder State of Charge",
-        "🌡️ Cylinder Average Temperature",
-        "🔥 Cylinder Heat Losses (W)",
-        "🎛️ SensoComfort Control",
-        "🚿 Tapping Detail (Temperature Response)",
+        "Legionella Cycle Activity",
+        "Cylinder State of Charge",
+        "Cylinder Average Temperature",
+        "Cylinder Heat Losses (W)",
+        "SensoComfort Control",
+        "Tapping Detail (Temperature Response)",
         "Buffer Stratification (4-Layer)",
         "Buffer Pump Flow (L/min)",
-        "🌡️ Heating Circuit Mixer Temperatures", 
-        "📊 Buffer State of Charge (HP vs Immersion)", 
-        "🌡️ Buffer Tank Average Temperature", 
-        "🔥 Buffer Tank Heat Losses (W)", 
+        "Heating Circuit Mixer Temperatures", 
+        "Buffer State of Charge (HP vs Immersion)", 
+        "Buffer Tank Average Temperature", 
+        "Buffer Tank Heat Losses (W)", 
 
         
 
@@ -2530,9 +2718,9 @@ def main():
             st.altair_chart(chart_power(df), use_container_width=True)
         elif choice == "Heat Pump Heat Output (W)":
             st.altair_chart(chart_heat(df), use_container_width=True)
-        elif choice == "🔥 Cylinder Heat Losses (W)":
+        elif choice == "Cylinder Heat Losses (W)":
             st.altair_chart(chart_tank_losses(df), use_container_width=True)
-        elif choice == "🌡️ Cylinder Average Temperature":
+        elif choice == "Cylinder Average Temperature":
             st.altair_chart(chart_tank_temperature(df), use_container_width=True)
             
             # Show temperature statistics
@@ -2563,7 +2751,7 @@ def main():
             else:
                 st.info("No Legionella data available for this simulation.")
 
-        elif choice == "🎛️ SensoComfort Control":
+        elif choice == "SensoComfort Control":
             st.altair_chart(chart_sensocomfort(df), use_container_width=True)
             
             # Show mode distribution
@@ -2597,7 +2785,7 @@ def main():
 
             if len(layer_cols) < 4:
                 st.warning("⚠️ Buffer tank is not enabled. Please enable buffer tank in the sidebar to view this graph.")
-                st.info("💡 **To enable:** Sidebar → 🔥 Buffer Tank → Enable Buffer: **On**")
+                st.info("💡 **To enable:** Sidebar → Buffer Tank → Enable Buffer: **On**")
             else:
                 st.altair_chart(chart_buffer_strat(df), use_container_width=True)
 
@@ -2616,7 +2804,7 @@ def main():
                 if "Buffer Pump Flow (L/min)" in df.columns:
                     st.altair_chart(chart_buffer_pump(df), use_container_width=True)
                     st.info(
-                    f"🧯 Buffer pump is modeled as a constant {st.session_state.get('pump_flow_lpm', 0)} L/min "
+                    f"Buffer pump is modeled as a constant {st.session_state.get('pump_flow_lpm', 0)} L/min "
                     f"whenever 'Boost Cylinder via Buffer Pump' is enabled."
                 )
                 else:
@@ -2707,7 +2895,7 @@ def main():
                     st.warning("⚠️ Buffer tank is not enabled.")
                     st.info("💡 **To enable:** Sidebar → 🔥 Buffer Tank → Enable Buffer: **On**")
 
-        elif choice == "📊 Cylinder State of Charge":
+        elif choice == "Cylinder State of Charge":
             st.altair_chart(chart_cylinder_soc(df), use_container_width=True)
     
             # Calculate SOC statistics
@@ -2772,75 +2960,6 @@ def main():
             summary = st.session_state["summary"]
             layer_properties = st.session_state["layer_properties"]
             ...
-                    # ==============================================================
-        # 📄 Preview & Export PDF Report
-        # ==============================================================
-        st.markdown("---")
-        st.subheader("📄 Preview & Export PDF Report")
-
-        # Pack the parameters we might want to store with the report
-        report_params = {
-            "sim_period": sim_period,
-            "Utank": Utank,
-            "Tamb": Tamb,
-            "dtm": dtm,
-            "setp": setp,
-            "hyst": hyst,
-            "Pmin": Pmin,
-            "Pmax": Pmax,
-            "hp_model_name": hp_model_name,
-        }
-
-        col_pdf_btn, col_pdf_info = st.columns([1, 2])
-        with col_pdf_btn:
-            generate_clicked = st.button("🧾 Generate PDF Report")
-
-        if generate_clicked:
-            try:
-                with st.spinner("📄 Building PDF report (2×2 chart grid)..."):
-                    pdf_bytes = generate_pdf_report(
-                        df=df,
-                        summary=summary,
-                        sim_period=sim_period,
-                        params=report_params,
-                    )
-                st.session_state["report_pdf_bytes"] = pdf_bytes
-                st.success("✅ PDF report generated.")
-            except Exception as e:
-                st.error(f"❌ Failed to generate PDF: {e}")
-
-        if "report_pdf_bytes" in st.session_state:
-            pdf_bytes = st.session_state["report_pdf_bytes"]
-
-            # Preview first page as image (if PyMuPDF available)
-            if FITZ_AVAILABLE:
-                preview_img_bytes = render_pdf_preview_first_page(pdf_bytes)
-                if preview_img_bytes:
-                    st.image(
-                        preview_img_bytes,
-                        caption="PDF Preview – Page 1",
-                        use_column_width=True,
-                    )
-                else:
-                    st.info("Preview not available – unable to render PDF page.")
-            else:
-                st.info("PyMuPDF (fitz) not installed – image preview disabled.")
-
-            # Download button
-            filename = f"Vaillant_150L_Report_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
-            st.download_button(
-                label="⬇️ Download PDF Report",
-                data=pdf_bytes,
-                file_name=filename,
-                mime="application/pdf",
-            )
-        else:
-            with col_pdf_info:
-                st.info(
-                    "Click **“🧾 Generate PDF Report”** to build a multi-page PDF with "
-                    "all key charts (2×2 grid per page) and the simulation summary."
-                )
-
 
 
         # --------------------------------------
@@ -2885,84 +3004,198 @@ BUFFER_CP = 4186
 
 P_EL_MAX = 5000
 
-def build_pdf_charts(df: pd.DataFrame) -> List[alt.Chart]:
+def build_pdf_charts_selective(df: pd.DataFrame, chart_selections: Dict[str, bool]) -> List[alt.Chart]:
     """
-    Build the ordered list of charts that will go into the PDF.
-    Each chart will be rendered and packed 4 per page (2×2 grid).
+    Build charts with ROBUST error handling.
+    Skips any chart that fails instead of crashing.
     """
-    charts: List[alt.Chart] = []
-
-    # Core cylinder charts
-    charts.append(chart_stratification(df))
-    charts.append(chart_tank_temperature(df))
-    charts.append(chart_cop(df))
-    charts.append(chart_power(df))
-    charts.append(chart_heat(df))
-    charts.append(chart_tank_losses(df))
-    charts.append(chart_cylinder_soc(df))
-    charts.append(chart_tap(df))
-
-    # Optional / conditional charts
-    if "Legionella_Active" in df.columns and df["Legionella_Active"].any():
-        leg = chart_legionella(df)
-        if leg is not None:
-            charts.append(leg)
-
-    if "Senso_Setpoint (°C)" in df.columns:
-        charts.append(chart_sensocomfort(df))
-
-    # Buffer charts if buffer enabled
-    if any(c.startswith("Buffer ") for c in df.columns):
-        buf_strat = chart_buffer_strat(df)
-        if buf_strat is not None:
-            charts.append(buf_strat)
-        charts.append(chart_buffer_temperature(df))
-        charts.append(chart_buffer_losses(df))
-        charts.append(chart_soc(df))
-        charts.append(chart_buffer_pump(df))
-        charts.append(chart_mixer_temps(df))
-
-    # Filter out dummy empty charts
-    charts = [ch for ch in charts if isinstance(ch, alt.Chart) or isinstance(ch, alt.LayerChart)]
-
+    charts = []
+    
+    def try_add_chart(key: str, chart_func, name: str):
+        """Helper to safely try adding a chart."""
+        if not chart_selections.get(key, False):
+            return
+        try:
+            chart = chart_func()
+            if chart is not None:
+                # Validate by trying to convert to dict
+                try:
+                    _ = chart.to_dict()
+                    charts.append(chart)
+                    print(f"✅ Added: {name}")
+                except:
+                    print(f"⚠️ Skipped {name}: Invalid chart structure")
+        except Exception as e:
+            print(f"⚠️ Skipped {name}: {str(e)[:40]}")
+    
+    # Try each chart individually
+    try_add_chart("cop", lambda: chart_cop(df), "COP")
+    try_add_chart("stratification", lambda: chart_stratification(df), "Stratification")
+    try_add_chart("power", lambda: chart_power(df), "Power")
+    try_add_chart("heat", lambda: chart_heat(df), "Heat")
+    try_add_chart("tank_temp", lambda: chart_tank_temperature(df), "Tank Temp")
+    try_add_chart("tank_losses", lambda: chart_tank_losses(df), "Tank Losses")
+    try_add_chart("modulation", lambda: chart_modulation(df), "Modulation")
+    try_add_chart("tap", lambda: chart_tap(df), "Tap")
+    try_add_chart("soc", lambda: chart_cylinder_soc(df), "Cylinder SOC")
+    
+    # Conditional charts
+    if chart_selections.get("legionella", False):
+        if "Legionella_Active" in df.columns:
+            try_add_chart("legionella", lambda: chart_legionella(df), "Legionella")
+    
+    if chart_selections.get("senso", False):
+        if "Senso_Setpoint (°C)" in df.columns:
+            try_add_chart("senso", lambda: chart_sensocomfort(df), "SensoComfort")
+    
+    # Buffer charts - MORE CAREFUL HERE
+    if chart_selections.get("buffer", False):
+        if any(c.startswith("Buffer ") for c in df.columns):
+            try_add_chart("buffer", lambda: chart_buffer_strat(df), "Buffer Strat")
+            try_add_chart("buffer", lambda: chart_buffer_temperature(df), "Buffer Temp")
+            try_add_chart("buffer", lambda: chart_buffer_losses(df), "Buffer Losses")
+            try_add_chart("buffer", lambda: chart_soc(df), "Buffer SOC")
+            try_add_chart("buffer", lambda: chart_buffer_pump(df), "Buffer Pump")
+            try_add_chart("buffer", lambda: chart_mixer_temps(df), "Mixer Temps")
+    
+    print(f"\n📊 Total valid charts for PDF: {len(charts)}")
     return charts
+
+
+def render_pdf_preview_first_page(pdf_bytes: bytes) -> bytes:
+    """
+    Return a PNG image (bytes) of the first page of the given PDF.
+    Requires PyMuPDF (fitz).
+    
+    Args:
+        pdf_bytes: PDF document as bytes
+    
+    Returns:
+        PNG image as bytes, or empty bytes if rendering fails
+    """
+    if not FITZ_AVAILABLE:
+        return b""
+
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        if len(doc) == 0:
+            return b""
+
+        # Get first page
+        page = doc[0]
+        
+        # Render page to pixmap (image)
+        # Scale factor for better quality preview
+        zoom = 2.0  # Increase for higher quality
+        mat = fitz.Matrix(zoom, zoom)
+        pix = page.get_pixmap(matrix=mat)
+        
+        # Convert to PNG bytes
+        img_bytes = pix.tobytes("png")
+        
+        doc.close()
+        return img_bytes
+        
+    except Exception as e:
+        print(f"⚠️ Error rendering PDF preview: {e}")
+        return b""
 
 def generate_pdf_report(df: pd.DataFrame,
                         summary: Dict[str, Any],
                         sim_period: str,
-                        params: Dict[str, Any]) -> bytes:
+                        params: Dict[str, Any],
+                        chart_selections: Dict[str, bool] = None) -> bytes:
     """
     Generate a multi-page PDF report with:
+      - Vaillant logo on title page (if available)
       - Title + summary on page 1
       - Subsequent pages: 2×2 chart grids (4 charts / page)
-    Returns: PDF as bytes.
+      - Only includes charts selected by user
+    
+    Args:
+        df: Simulation results dataframe
+        summary: Dictionary of summary statistics
+        sim_period: "24 Hours" or "7 Days"
+        params: Dictionary of simulation parameters
+        chart_selections: Dictionary of chart names to include (optional)
+    
+    Returns:
+        PDF as bytes ready for download
     """
 
     if not REPORTLAB_AVAILABLE:
         raise RuntimeError("reportlab is not installed – cannot generate PDF.")
 
     if not ALTAIR_EXPORT_AVAILABLE:
-        raise RuntimeError("altair_saver is not installed – cannot export charts to PNG.")
+        raise RuntimeError("altair_saver/vl-convert is not installed – cannot export charts to PNG.")
 
-    charts = build_pdf_charts(df)
+    # Default to all charts if no selection provided
+    if chart_selections is None:
+        chart_selections = {
+            "cop": True,
+            "stratification": True,
+            "power": True,
+            "heat": True,
+            "tank_temp": True,
+            "tank_losses": True,
+            "modulation": True,
+            "tap": True,
+            "soc": True,
+            "legionella": True,
+            "senso": True,
+            "buffer": True,
+        }
+
+    charts = build_pdf_charts_selective(df, chart_selections)
     if not charts:
-        raise RuntimeError("No charts available to export.")
+        raise RuntimeError("No charts selected for export. Please select at least one chart.")
 
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
     page_width, page_height = A4
 
-    # ---------- Page 1: Title & summary ----------
+    # ---------- Page 1: Vaillant Logo + Title & summary ----------
     margin = 40
     y = page_height - margin
 
+    # Try to add Vaillant logo at the top
+    logo_loaded = False
+    try:
+        logo_path = "vaillant_logo.png"
+        if os.path.exists(logo_path):
+            img = ImageReader(logo_path)
+            # Center the logo, scale to reasonable size
+            logo_width = 150
+            logo_height = 50
+            x_logo = (page_width - logo_width) / 2
+            c.drawImage(
+                img,
+                x_logo,
+                y - logo_height,
+                width=logo_width,
+                height=logo_height,
+                preserveAspectRatio=True,
+                anchor="c",
+            )
+            y -= (logo_height + 20)
+            logo_loaded = True
+        else:
+            print("ℹ️ Logo file 'vaillant_logo.png' not found - proceeding without logo")
+    except Exception as e:
+        print(f"⚠️ Could not load logo: {e}")
+        # If logo not found, just skip it
+
+    # Title (centered)
     title = "Vaillant 150 L Cylinder – Simulation Report"
     c.setFont("Helvetica-Bold", 18)
-    c.drawString(margin, y, title)
+    title_width = c.stringWidth(title, "Helvetica-Bold", 18)
+    c.drawString((page_width - title_width) / 2, y, title)
     y -= 30
 
+    # Metadata
     c.setFont("Helvetica", 11)
-    c.drawString(margin, y, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    timestamp = f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    c.drawString(margin, y, timestamp)
     y -= 18
     c.drawString(margin, y, f"Simulation Period: {sim_period}")
     y -= 24
@@ -2984,6 +3217,12 @@ def generate_pdf_report(df: pd.DataFrame,
             c.showPage()
             y = page_height - margin
             c.setFont("Helvetica", 10)
+
+    # Add selected charts info
+    y -= 10
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(margin, y, f"Report includes {len(charts)} selected chart(s)")
+    y -= 20
 
     c.showPage()
 
@@ -3038,56 +3277,188 @@ def generate_pdf_report(df: pd.DataFrame,
     buffer.close()
     return pdf_bytes
 
-def render_pdf_preview_first_page(pdf_bytes: bytes) -> bytes:
-    """
-    Return a PNG image (bytes) of the first page of the given PDF.
-    Requires PyMuPDF (fitz).
-    """
-    if not FITZ_AVAILABLE:
-        return b""
-
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    if len(doc) == 0:
-        return b""
-
-    page = doc[0]
-    pix = page.get_pixmap()
-    img_bytes = pix.tobytes("png")
-    doc.close()
-    return img_bytes
 
 
-def generate_pdf_report(df: pd.DataFrame,
-                        summary: dict,
-                        params: dict,
-                        sim_period: str) -> bytes:
-    """
-    Build a multi-page PDF report:
-    - Title page
-    - Simulation summary
-    - Input parameters (from sidebar)
-    - Daily breakdown (for 7-day sims)
-    - Key charts (saved via Altair → PNG)
-    Returns bytes ready for st.download_button(data=...).
-    """
-    buffer = BytesIO()
-    doc = SimpleDocTemplate(
-        buffer,
-        pagesize=A4,
-        rightMargin=30,
-        leftMargin=30,
-        topMargin=30,
-        bottomMargin=30,
-    )
+    # ---------- Subsequent pages: 2×2 chart grid ----------
+    # Layout: 2 columns × 2 rows per page
+    cols = 2
+    rows = 2
+    cell_w = (page_width - 2 * margin) / cols
+    cell_h = (page_height - 2 * margin) / rows
 
-    styles = getSampleStyleSheet()
-    style_title = styles["Title"]
-    style_h1 = styles["Heading1"]
-    style_h2 = styles["Heading2"]
-    style_normal = styles["Normal"]
+    chart_index = 0
+    total_charts = len(charts)
 
-    story = []
+    while chart_index < total_charts:
+        for row in range(rows):
+            for col in range(cols):
+                if chart_index >= total_charts:
+                    break
 
+                chart = charts[chart_index]
+
+                # Export Altair chart to PNG bytes
+                img_buf = io.BytesIO()
+                # Slightly higher scale for better print quality
+                chart.save(img_buf, format="png", scale=2)
+                img_buf.seek(0)
+
+                img = ImageReader(img_buf)
+
+                # Compute position
+                x = margin + col * cell_w
+                # reportlab coords start bottom-left
+                y = margin + (rows - 1 - row) * cell_h
+
+                # Keep aspect ratio – fit within cell
+                c.drawImage(
+                    img,
+                    x,
+                    y,
+                    width=cell_w - 10,
+                    height=cell_h - 10,
+                    preserveAspectRatio=True,
+                    anchor="c",
+                )
+
+                chart_index += 1
+
+        c.showPage()
+
+    c.save()
+    pdf_bytes = buffer.getvalue()
+    buffer.close()
+    return pdf_bytes
+
+# ==============================================================
+    # 📄 PDF Report Preview & Export
+    # ==============================================================
+    st.markdown("---")
+    st.subheader("📄 PDF Report Preview & Export")
+
+    # Pack the parameters
+    params_for_pdf = st.session_state.get("last_params_dict", {})
+    
+    # --- Graph Selection Checkboxes ---
+    st.markdown("#### Select Graphs to Include in PDF")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.markdown("**Core Metrics**")
+        include_cop = st.checkbox("COP", value=True, key="pdf_cop")
+        include_stratification = st.checkbox("Cylinder Stratification", value=True, key="pdf_strat")
+        include_power = st.checkbox("HP Power", value=True, key="pdf_power")
+        include_heat = st.checkbox("HP Heat Output", value=True, key="pdf_heat")
+        
+    with col2:
+        st.markdown("**Temperature & Losses**")
+        include_tank_temp = st.checkbox("Cylinder Avg Temperature", value=True, key="pdf_tank_temp")
+        include_tank_losses = st.checkbox("Cylinder Heat Losses", value=True, key="pdf_tank_losses")
+        include_modulation = st.checkbox("HP Modulation", value=True, key="pdf_mod")
+        include_tap = st.checkbox("Tap Flow", value=True, key="pdf_tap")
+        
+    with col3:
+        st.markdown("**Advanced Features**")
+        include_soc = st.checkbox("Cylinder SOC", value=True, key="pdf_soc")
+        include_legionella = st.checkbox("Legionella Cycle", value=legionella_enabled=="On", key="pdf_leg")
+        include_senso = st.checkbox("SensoComfort", value=senso_enabled=="On", key="pdf_senso")
+        include_buffer = st.checkbox("Buffer Charts", value=buffer_enabled=="On", key="pdf_buffer")
+
+    # Store selections in a dict
+    chart_selections = {
+        "cop": include_cop,
+        "stratification": include_stratification,
+        "power": include_power,
+        "heat": include_heat,
+        "tank_temp": include_tank_temp,
+        "tank_losses": include_tank_losses,
+        "modulation": include_modulation,
+        "tap": include_tap,
+        "soc": include_soc,
+        "legionella": include_legionella,
+        "senso": include_senso,
+        "buffer": include_buffer,
+    }
+
+    st.markdown("---")
+    
+    # --- Generate PDF Button ---
+    col_btn, col_info = st.columns([1, 2])
+    
+    with col_btn:
+        generate_clicked = st.button("📄 Generate PDF Report", key="btn_generate_pdf_unified")
+    
+    with col_info:
+        num_selected = sum(chart_selections.values())
+        st.info(f"📊 {num_selected} chart(s) selected for PDF export")
+
+    # Generate PDF when button clicked
+    if generate_clicked:
+        if num_selected == 0:
+            st.warning("⚠️ Please select at least one chart to include in the PDF.")
+        else:
+            try:
+                with st.spinner("📄 Building PDF report with selected charts..."):
+                    pdf_bytes = generate_pdf_report(
+                        df=df,
+                        summary=summary,
+                        params=params_for_pdf,
+                        sim_period=sim_period,
+                        chart_selections=chart_selections,
+                    )
+                st.session_state["pdf_report_bytes"] = pdf_bytes
+                st.success("✅ PDF report generated successfully!")
+            except Exception as e:
+                st.error(f"❌ Failed to generate PDF: {e}")
+                with st.expander("🔍 Show error details"):
+                    import traceback
+                    st.code(traceback.format_exc())
+
+    # --- Preview & Download ---
+    if "pdf_report_bytes" in st.session_state:
+        pdf_bytes = st.session_state["pdf_report_bytes"]
+        
+        st.markdown("#### 📋 Report Preview")
+        
+        # Preview first page as image (if PyMuPDF available)
+        if FITZ_AVAILABLE:
+            try:
+                preview_img_bytes = render_pdf_preview_first_page(pdf_bytes)
+                if preview_img_bytes:
+                    st.image(
+                        preview_img_bytes,
+                        caption="PDF Preview – Page 1 (with Vaillant logo)",
+                        use_column_width=True,
+                    )
+                else:
+                    st.info("Preview rendering failed – but PDF should be valid for download.")
+            except Exception as e:
+                st.warning(f"Preview error: {e}")
+        else:
+            st.info("💡 Install PyMuPDF for preview: `pip install PyMuPDF`")
+
+        # Download button
+        st.markdown("---")
+        filename = f"Vaillant_150L_Report_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
+        st.download_button(
+            label="⬇️ Download PDF Report",
+            data=pdf_bytes,
+            file_name=filename,
+            mime="application/pdf",
+        )
+    else:
+        st.info(
+            "💡 **How to generate your report:**\n\n"
+            "1. ✅ Select the graphs you want using the checkboxes above\n"
+            "2. 🖱️ Click **'Generate PDF Report'** button\n"
+            "3. 👁️ Preview will appear below\n"
+            "4. ⬇️ Download your custom PDF report\n\n"
+            "📋 The report includes:\n"
+            "- Vaillant logo (if vaillant_logo.png exists)\n"
+            "- Simulation summary and parameters\n"
+            "- Your selected charts in a professional 2×2 grid layout"
+        )
     # -----------------------
     # Title / cover section
     # -----------------------
