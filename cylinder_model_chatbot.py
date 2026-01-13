@@ -171,16 +171,7 @@ else:
     client = OpenAI(api_key=API_KEY)
     st.success("✅ OpenAI client initialized!")
 
-# --------------------------------------------------------
-# 🔑 OpenAI client
-# --------------------------------------------------------
-API_KEY = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None)
 
-if not API_KEY:
-    st.warning("⚠️ OPENAI_API_KEY not found. Please add it to Streamlit secrets or environment.")
-    client = None
-else:
-    client = OpenAI(api_key=API_KEY)
 
 # --------------------------------------------------------
 # 📂 Load FAISS index + metadata
