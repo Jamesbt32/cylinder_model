@@ -2108,15 +2108,26 @@ if "retrieved_items" not in st.session_state:
 # --------------------------------------------------------------
 # Helper: load ALL images for a manual page
 # --------------------------------------------------------------
-def get_all_images_for_page(page_num):
-    page_dir = f"manual_images/page_{page_num}"
-    if not os.path.exists(page_dir):
-        return []
-    return [
-        os.path.join(page_dir, f)
-        for f in sorted(os.listdir(page_dir))
-        if f.lower().endswith((".png", ".jpg", ".jpeg"))
-    ]
+def resolve_images_for_item(item):
+    images = []
+
+    # 1️⃣ Preferred: explicit image paths from FAISS metadata
+    if "image_paths" in item and item["image_paths"]:
+        for p in item["image_paths"]:
+            if os.path.exists(p):
+                images.append(p)
+
+    # 2️⃣ Fallback: scan any directory containing page number
+    if not images:
+        base_dir = "manual_images"
+        if os.path.exists(base_dir):
+            for root, _, files in os.walk(base_dir):
+                for f in files:
+                    if str(item.get("page")) in f and f.lower().endswith((".png", ".jpg", ".jpeg")):
+                        images.append(os.path.join(root, f))
+
+    return sorted(set(images))
+
 
 # --------------------------------------------------------------
 # Run chatbot only if query changed
@@ -2252,7 +2263,8 @@ if st.session_state.chatbot_response and query:
 
             st.markdown(f"#### 📄 Manual Page {page_num}")
 
-            images = get_all_images_for_page(page_num)
+            images = resolve_images_for_item(item)
+
 
             if not images:
                 st.info("No diagrams found for this page.")
