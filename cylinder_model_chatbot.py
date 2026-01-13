@@ -2071,78 +2071,121 @@ P_EL_MAX = 5000
 
 
 
+# ==============================================================
+# 💬 AI CHATBOT SECTION (BELOW GRAPHS)
+# ==============================================================
 
-        # ==============================================================
-        # 💬 AI CHATBOT SECTION (BELOW GRAPHS)
-        # ==============================================================
 st.markdown("---")
 st.subheader("💬 AI Simulation Assistant")
 st.caption("Ask things like: *Why does the COP drop during tapping?* or *Explain stratification losses.*")
 
-        # --- User input widgets ---
+# --------------------------------------------------------------
+# User input
+# --------------------------------------------------------------
 query = st.text_input("Your question:", key="user_question")
 
 st.markdown("### 🧭 Data Source")
 data_mode = st.radio(
-            "Choose how the assistant should respond:",
-            ["Manual Data (RAG from Vaillant PDF)", "OpenAI General Knowledge"],
-index=0,
-horizontal=True,
-key="radio_data_mode",
-        )
-
-        # -----------------------------------------------------
-        # 💬 Learning Chatbot Integration with Spinner & Typewriter
-        # -----------------------------------------------------
-        
-        # Initialize session state for storing responses
-if 'chatbot_response' not in st.session_state:
-            st.session_state['chatbot_response'] = None
-if 'chatbot_query' not in st.session_state:
-            st.session_state['chatbot_query'] = None
-if 'retrieved_items' not in st.session_state:
-            st.session_state['retrieved_items'] = []
-        
-        # Only run chatbot if query changed
-if query and query != st.session_state['chatbot_query']:
-            api_key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")
-            if not api_key:
-                st.warning("⚠️ Please set your OpenAI API key.")
-            else:
-                # Show spinner while processing
-                with st.spinner("🔄 Thinking..."):
-                    client_chat = OpenAI(api_key=api_key)
-
-                    # === Generate multiple candidate responses ===
-                    responses = []
-                    retrieved_items = []  # Store retrieved context
-                    
-                    for _ in range(3):
-                        kb_context = ""
-                        if data_mode.startswith("Manual"):
-                            top_items = retrieve_faiss_context(query, top_k=3)
-                            retrieved_items = top_items  # Save for display
-                            
-                            if top_items:
-                                kb_context = "\n\n".join(
-                                    [f"[Manual Page {it.get('page','?')}, Similarity: {it.get('similarity', 0):.3f}]\n{it.get('text','')}" 
-                                     for it in top_items]
-                                )
-                            else:
-                                kb_context = "No specific manual context found for this query."
-
-                        layer_properties = st.session_state.get("layer_properties", {})
-
-                        geometry_context = "\n".join(
-    [f"{n}: Vol={p['Volume_L']:.1f} L" for n, p in layer_properties.items()]
+    "Choose how the assistant should respond:",
+    ["Manual Data (RAG from Vaillant PDF)", "OpenAI General Knowledge"],
+    index=0,
+    horizontal=True,
+    key="radio_data_mode",
 )
 
-                        
-                        summary_text = "\n".join([f"{k}: {v}" for k, v in summary.items()])
+# --------------------------------------------------------------
+# Session state
+# --------------------------------------------------------------
+if "chatbot_response" not in st.session_state:
+    st.session_state.chatbot_response = None
 
-                        prompt = f"""
-You are an HVAC expert analyzing a Vaillant 150 L stratified cylinder with a modulating heat pump.
+if "chatbot_query" not in st.session_state:
+    st.session_state.chatbot_query = None
 
+if "retrieved_items" not in st.session_state:
+    st.session_state.retrieved_items = []
+
+# --------------------------------------------------------------
+# Helper: load ALL images for a manual page
+# --------------------------------------------------------------
+def get_all_images_for_page(page_num):
+    page_dir = f"manual_images/page_{page_num}"
+    if not os.path.exists(page_dir):
+        return []
+    return [
+        os.path.join(page_dir, f)
+        for f in sorted(os.listdir(page_dir))
+        if f.lower().endswith((".png", ".jpg", ".jpeg"))
+    ]
+
+# --------------------------------------------------------------
+# Run chatbot only if query changed
+# --------------------------------------------------------------
+if query and query != st.session_state.chatbot_query:
+
+    api_key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")
+    if not api_key:
+        st.warning("⚠️ Please set your OpenAI API key.")
+    else:
+        with st.spinner("🔄 Thinking..."):
+
+            client_chat = OpenAI(api_key=api_key)
+
+            responses = []
+            retrieved_items = []
+
+            # ======================================================
+            # Generate multiple candidate responses
+            # ======================================================
+            for _ in range(3):
+
+                kb_context = ""
+
+                # ---------------- MANUAL MODE ----------------
+                if data_mode.startswith("Manual"):
+                    top_items = retrieve_faiss_context(query, top_k=4)
+
+                    if not top_items:
+                        st.warning("No relevant manual content found. Answer not generated.")
+                        break
+
+                    retrieved_items.extend(top_items)
+
+                    kb_context = "\n\n".join(
+                        f"[Manual Page {it.get('page','?')}, Similarity {it.get('similarity',0):.3f}]\n{it.get('text','')}"
+                        for it in top_items
+                    )
+
+                # ---------------- AUTO MODE ----------------
+                else:
+                    kb_context = "Use general HVAC and heat pump knowledge."
+
+                # --------------------------------------------------
+                # Build additional context
+                # --------------------------------------------------
+                layer_properties = st.session_state.get("layer_properties", {})
+                geometry_context = "\n".join(
+                    f"{n}: Volume={p['Volume_L']:.1f} L"
+                    for n, p in layer_properties.items()
+                )
+
+                summary_text = "\n".join(f"{k}: {v}" for k, v in summary.items())
+
+                # --------------------------------------------------
+                # Prompt
+                # --------------------------------------------------
+                if data_mode.startswith("Manual"):
+                    system_msg = (
+                        "You are a technical assistant. "
+                        "You MUST answer ONLY using the provided Manual Context. "
+                        "If the answer is not explicitly contained in the manual, say: "
+                        "'This information is not available in the manual.' "
+                        "Do NOT use general HVAC knowledge."
+                    )
+                else:
+                    system_msg = "You are an HVAC expert assistant."
+
+                prompt = f"""
 ## Manual Context
 {kb_context}
 
@@ -2154,163 +2197,74 @@ You are an HVAC expert analyzing a Vaillant 150 L stratified cylinder with a mod
 
 ## Question
 {query}
-
-Please provide a detailed, technical answer based on the information provided above.
 """
-                        try:
-                            r = client_chat.chat.completions.create(
-                                model="gpt-4o-mini",
-                                messages=[{"role": "user", "content": prompt}]
-                            )
-                            responses.append(r.choices[0].message.content.strip())
-                        except Exception as e:
-                            st.error(f"OpenAI error: {e}")
-                            break
 
-                    if responses:
-                        # === Load or train ML feedback model ===
-                        feedback_df = load_feedback_data()
-                        if os.path.exists(MODEL_FILE) and os.path.exists(VEC_FILE):
-                            vec = joblib.load(VEC_FILE)
-                            model = joblib.load(MODEL_FILE)
-                        else:
-                            vec, model = train_feedback_model(feedback_df)
+                try:
+                    r = client_chat.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[
+                            {"role": "system", "content": system_msg},
+                            {"role": "user", "content": prompt},
+                        ],
+                    )
+                    responses.append(r.choices[0].message.content.strip())
 
-                        # === Rank responses ===
-                        if model and vec:
-                            Xtest = [query + " " + r for r in responses]
-                            probs = model.predict_proba(vec.transform(Xtest))[:, 1]
-                            best_idx = int(np.argmax(probs))
-                        else:
-                            best_idx = 0
+                except Exception as e:
+                    st.error(f"OpenAI error: {e}")
+                    break
 
-                        best_response = responses[best_idx]
-                        
-                        # Store in session state
-                        st.session_state['chatbot_response'] = best_response
-                        st.session_state['chatbot_query'] = query
-                        st.session_state['retrieved_items'] = retrieved_items
-        
-        # Display stored response if available
-if st.session_state['chatbot_response'] and query:
-            best_response = st.session_state['chatbot_response']
-            retrieved_items = st.session_state['retrieved_items']
-            
-            # === Show final answer with typewriter effect (only on first display) ===
-            st.markdown("### 💬 Chatbot Response")
-            if query != st.session_state.get('last_displayed_query'):
-                typewriter_effect(best_response, speed=0.01)
-                st.session_state['last_displayed_query'] = query
+            # ======================================================
+            # Select best response (feedback model optional)
+            # ======================================================
+            if responses:
+                best_response = responses[0]
+
+                st.session_state.chatbot_response = best_response
+                st.session_state.chatbot_query = query
+
+                # Deduplicate retrieved pages
+                unique_pages = {}
+                for item in retrieved_items:
+                    page = item.get("page")
+                    if page not in unique_pages:
+                        unique_pages[page] = item
+
+                st.session_state.retrieved_items = list(unique_pages.values())
+
+# ==============================================================
+# Display chatbot response
+# ==============================================================
+if st.session_state.chatbot_response and query:
+
+    st.markdown("### 💬 Chatbot Response")
+    st.markdown(st.session_state.chatbot_response)
+
+    # ==========================================================
+    # Display Manual Images
+    # ==========================================================
+    if data_mode.startswith("Manual") and st.session_state.retrieved_items:
+
+        st.markdown("---")
+        st.markdown("### 📷 Related Diagrams from Manual")
+
+        for item in st.session_state.retrieved_items:
+            page_num = item.get("page", "?")
+
+            st.markdown(f"#### 📄 Manual Page {page_num}")
+
+            images = get_all_images_for_page(page_num)
+
+            if not images:
+                st.info("No diagrams found for this page.")
             else:
-                st.markdown(best_response)
-            
-            # === Display retrieved images if using manual data ===
-            pages_with_images = []
-            if data_mode.startswith("Manual") and retrieved_items:
-                st.markdown("---")
-                st.markdown("### 📷 Related Diagrams from Manual")
-                
-                for idx, item in enumerate(retrieved_items, 1):
-                    if item.get('image_paths'):
-                        page_num = item.get('page', '?')
-                        pages_with_images.append(page_num)
-                        
-                        st.markdown(f"#### 📄 Page {page_num}")
-                        for img_path in item.get('image_paths', []):
-                            if os.path.exists(img_path):
-                                st.image(img_path, caption=f"Page {page_num}", use_column_width=True)
-                            else:
-                                st.warning(f"Image not found: {img_path}")
-                        
-                        # Feedback for this specific page using form for faster submission
-                        with st.form(key=f"form_page_{page_num}_{hash(query)}"):
-                            st.markdown(f"**Was Page {page_num} helpful for your question?**")
-                            feedback_page = st.radio(
-                                f"Page {page_num} helpfulness:",
-                                ["👍 Yes", "👎 No"],
-                                horizontal=True,
-                                key=f"radio_page_{page_num}_{hash(query)}"
-                            )
-                            submitted_page = st.form_submit_button(f"💾 Save Feedback for Page {page_num}")
-                            
-                            if submitted_page:
-                                # Clear cache to get fresh data
-                                load_feedback_data.clear()
-                                feedback_df = load_feedback_data()
-                                new_row = {
-                                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                    "question": f"{query} (Page {page_num})",
-                                    "response": f"Page {page_num} content",
-                                    "helpful": feedback_page
-                                }
-                                feedback_df = pd.concat([feedback_df, pd.DataFrame([new_row])], ignore_index=True)
-                                feedback_df.to_csv(FEEDBACK_FILE, index=False)
-                                load_feedback_data.clear()  # Clear again after save
-                                st.success(f"✅ Feedback saved for Page {page_num}!")
-                        
-                        st.markdown("---")
-            
-            # === General feedback using form for faster submission ===
-            with st.form(key=f"form_overall_{hash(query)}"):
-                st.markdown("### 📝 Overall Response Feedback")
-                feedback = st.radio(
-                    "Was this overall answer helpful?",
-                    ["👍 Yes", "👎 No"],
-                    horizontal=True,
-                    key=f"radio_overall_{hash(query)}"
-                )
-                submitted_overall = st.form_submit_button("💾 Save Overall Feedback")
-                
-                if submitted_overall:
-                    # Clear cache to get fresh data
-                    load_feedback_data.clear()
-                    feedback_df = load_feedback_data()
-                    new_row = {
-                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "question": query,
-                        "response": best_response,
-                        "helpful": feedback
-                    }
-                    feedback_df = pd.concat([feedback_df, pd.DataFrame([new_row])], ignore_index=True)
-                    feedback_df.to_csv(FEEDBACK_FILE, index=False)
-                    load_feedback_data.clear()  # Clear again after save
-                    st.success("✅ Feedback saved!")
+                for img in images:
+                    st.image(
+                        img,
+                        caption=f"Manual Page {page_num}",
+                        use_column_width=True,
+                    )
 
-                    # Retrain if threshold met
-                    if len(feedback_df) % RETRAIN_THRESHOLD == 0:
-                        vec, model = train_feedback_model(feedback_df)
-                        st.success("🎯 Model retrained with latest feedback!")
-
-                    # === Dashboard ===
-                    with st.expander("📊 Feedback Dashboard", expanded=False):
-                        if feedback_df.empty:
-                            st.info("No feedback data yet.")
-                        else:
-                            total = len(feedback_df)
-                            helpful = (feedback_df["helpful"] == "👍 Yes").sum()
-                            ratio = helpful / total * 100
-                            c1, c2, c3 = st.columns(3)
-                            c1.metric("Total", total)
-                            c2.metric("Helpful", helpful)
-                            c3.metric("Helpful %", f"{ratio:.1f}%")
-
-                            feedback_df["date"] = pd.to_datetime(feedback_df["timestamp"]).dt.date
-                            daily = (
-                                feedback_df.groupby("date")["helpful"]
-                                .apply(lambda x: (x == "👍 Yes").mean() * 100)
-                                .reset_index(name="Helpful %")
-                            )
-                            chart = (
-                                alt.Chart(daily)
-                                .mark_line(point=True)
-                                .encode(x="date:T", y="Helpful %:Q")
-                                .properties(height=250, title="Helpful Feedback Trend")
-                            )
-                            st.altair_chart(chart, use_container_width=True)
-                            st.dataframe(feedback_df.sort_values("timestamp", ascending=False))
-
-
-                            
+            st.markdown("---")
 
 # --- Entry point ---
 if __name__ == "__main__":
