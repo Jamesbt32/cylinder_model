@@ -422,6 +422,8 @@ def rebuild_knowledge_base(
     if not items:
         st.error("❌ No usable text extracted. KB rebuild aborted.")
         return
+    
+    
 
     # -------------------------------
     # ⚡ Embeddings (batched)
