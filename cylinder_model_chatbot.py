@@ -36,6 +36,528 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# ==============================================================
+# 📘 KNOWLEDGE BASE (AUTO-REBUILD) — FULL DROP-IN CODE
+# Adds:
+# ⚡ Batch embedding (faster)
+# 🧠 Chunk overlap + heading detection
+# 📊 Per-page rebuild progress bar
+# 🔍 Explain which PDF pages were used
+# 🧪 Self-test after rebuild
+# ==============================================================
+
+import os, re, json, time
+import numpy as np
+import streamlit as st
+from typing import List, Dict, Tuple, Optional, Any
+
+from PyPDF2 import PdfReader
+import faiss
+from openai import OpenAI
+
+# If you have fitz available already, keep your FITZ_AVAILABLE logic.
+# This block assumes you already created `client` earlier as OpenAI(api_key=API_KEY).
+# If not, it will create a local client inside the rebuild function from env/secrets.
+
+# -----------------------------------------------------
+# ✅ Session-state bootstrap (keep near top of file)
+# -----------------------------------------------------
+if "kb_version" not in st.session_state:
+    st.session_state.kb_version = 0
+if "kb_checked" not in st.session_state:
+    st.session_state.kb_checked = False
+if "pdf_mtime" not in st.session_state:
+    st.session_state.pdf_mtime = None
+if "kb_last_build_report" not in st.session_state:
+    st.session_state.kb_last_build_report = {}
+if "kb_last_selftest" not in st.session_state:
+    st.session_state.kb_last_selftest = {}
+
+
+# -----------------------------------------------------
+# 🧠 Chunking helpers: overlap + heading detection
+# -----------------------------------------------------
+_HEADING_RE = re.compile(
+    r"^\s*(?:[A-Z0-9][A-Z0-9 \-–—/]{6,}|[0-9]+\.[0-9.]*\s+\S+.+|.+:)\s*$"
+)
+
+def _clean_text(text: str) -> str:
+    text = text.replace("\x00", " ")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+def detect_headings(text: str) -> List[Tuple[int, str]]:
+    """
+    Returns list of (line_index, heading_text) for lines that look like headings.
+    Simple heuristic: ALL CAPS / numbered headings / lines ending with ':'.
+    """
+    headings = []
+    lines = [ln.strip() for ln in text.splitlines()]
+    for i, ln in enumerate(lines):
+        if not ln:
+            continue
+        if _HEADING_RE.match(ln):
+            headings.append((i, ln[:120]))
+    return headings
+
+def chunk_text_with_overlap(
+    text: str,
+    max_words: int = 450,
+    overlap_words: int = 80,
+) -> List[str]:
+    """
+    Word-based chunking with overlap.
+    """
+    words = text.split()
+    if not words:
+        return []
+
+    chunks = []
+    start = 0
+    n = len(words)
+
+    while start < n:
+        end = min(start + max_words, n)
+        chunk = " ".join(words[start:end]).strip()
+        if chunk:
+            chunks.append(chunk)
+        if end == n:
+            break
+        start = max(0, end - overlap_words)
+
+    return chunks
+
+def chunk_page_text(
+    page_text: str,
+    max_words: int = 450,
+    overlap_words: int = 80
+) -> List[Dict[str, Any]]:
+    """
+    Produces chunk dicts including detected heading context.
+    """
+    page_text = _clean_text(page_text)
+    if len(page_text) < 40:
+        return []
+
+    lines = [ln.strip() for ln in page_text.splitlines()]
+    headings = detect_headings(page_text)
+
+    # Build a "heading context" per line: last heading above that line
+    last_heading_for_line = {}
+    last = None
+    h_idx = 0
+    for i in range(len(lines)):
+        while h_idx < len(headings) and headings[h_idx][0] == i:
+            last = headings[h_idx][1]
+            h_idx += 1
+        last_heading_for_line[i] = last
+
+    # Re-join with line breaks for approximate line grouping
+    joined = "\n".join(lines)
+
+    # Chunk at word-level
+    raw_chunks = chunk_text_with_overlap(joined, max_words=max_words, overlap_words=overlap_words)
+
+    # Assign a best-effort heading context: find the first line that appears in chunk
+    chunk_dicts = []
+    for ch in raw_chunks:
+        # naive: use first non-empty line in chunk for heading lookup
+        ch_lines = [l.strip() for l in ch.splitlines() if l.strip()]
+        heading_ctx = None
+        if ch_lines:
+            first_line = ch_lines[0]
+            try:
+                # Find its index in lines
+                li = lines.index(first_line)
+                heading_ctx = last_heading_for_line.get(li)
+            except ValueError:
+                heading_ctx = None
+
+        chunk_dicts.append({
+            "text": ch,
+            "heading": heading_ctx
+        })
+
+    return chunk_dicts
+
+
+# -----------------------------------------------------
+# ⚡ Batched embeddings helper
+# -----------------------------------------------------
+def embed_texts_batched(
+    client_local: OpenAI,
+    texts: List[str],
+    model: str = "text-embedding-3-large",
+    batch_size: int = 96,
+    sleep_s: float = 0.0
+) -> np.ndarray:
+    """
+    Returns embeddings matrix float32 [N, D].
+    Uses OpenAI embeddings endpoint with batched input.
+    """
+    vectors: List[np.ndarray] = []
+    n = len(texts)
+    for i in range(0, n, batch_size):
+        batch = texts[i:i + batch_size]
+        resp = client_local.embeddings.create(model=model, input=batch)
+        # Keep order stable
+        embs = [np.array(d.embedding, dtype="float32") for d in resp.data]
+        vectors.extend(embs)
+        if sleep_s > 0:
+            time.sleep(sleep_s)
+    mat = np.vstack(vectors) if vectors else np.zeros((0, 0), dtype="float32")
+    return mat
+
+
+# -----------------------------------------------------
+# 📂 FAISS loader (versioned cache)
+# -----------------------------------------------------
+@st.cache_resource
+def load_faiss_index(kb_version: int) -> Tuple[Optional[faiss.Index], Optional[List[Dict[str, Any]]]]:
+    kb_dir = os.path.join(os.path.dirname(__file__), "kb")
+    idx_path = os.path.join(kb_dir, "vaillant_joint_faiss.index")
+    meta_path = os.path.join(kb_dir, "vaillant_joint_meta.json")
+
+    if not (os.path.exists(idx_path) and os.path.exists(meta_path)):
+        return None, None
+
+    try:
+        index = faiss.read_index(idx_path)
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        return index, meta
+    except Exception as e:
+        st.error(f"❌ Failed to load FAISS: {e}")
+        return None, None
+
+
+# -----------------------------------------------------
+# 🔍 Retrieval (uses versioned loader)
+# -----------------------------------------------------
+def retrieve_faiss_context(query: str, top_k: int = 3, show_debug: bool = False):
+    index, meta = load_faiss_index(st.session_state.kb_version)
+    if not index or not meta:
+        if show_debug:
+            st.warning("⚠️ FAISS index not loaded.")
+        return []
+
+    api_key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None)
+    if not api_key:
+        if show_debug:
+            st.error("⚠️ Missing OPENAI_API_KEY")
+        return []
+
+    try:
+        client_local = OpenAI(api_key=api_key)
+        emb_resp = client_local.embeddings.create(
+            model="text-embedding-3-large",
+            input=query
+        )
+        emb_vec = np.array(emb_resp.data[0].embedding, dtype="float32").reshape(1, -1)
+        faiss.normalize_L2(emb_vec)
+
+        scores, ids = index.search(emb_vec, top_k)
+        results = []
+        for score, idx in zip(scores[0], ids[0]):
+            if 0 <= idx < len(meta):
+                item = dict(meta[idx])
+                item["similarity"] = float(score)
+                results.append(item)
+
+        if show_debug:
+            st.write(f"Top-{len(results)} results:")
+            for r in results:
+                st.write(
+                    f"- p{r.get('page')} sim={r.get('similarity'):.3f} "
+                    f"heading={r.get('heading') or '—'}"
+                )
+
+        return results
+    except Exception as e:
+        if show_debug:
+            st.error(f"⚠️ Retrieval error: {e}")
+        return []
+
+
+# -----------------------------------------------------
+# 📊 🧪 Self-test after rebuild
+# -----------------------------------------------------
+def kb_self_test(sample_queries: List[str] = None, top_k: int = 3) -> Dict[str, Any]:
+    if sample_queries is None:
+        sample_queries = [
+            "heat pump operation",
+            "legionella cycle",
+            "installation diagram",
+            "temperature sensor",
+        ]
+
+    report: Dict[str, Any] = {
+        "ok": False,
+        "checks": [],
+        "samples": []
+    }
+
+    index, meta = load_faiss_index(st.session_state.kb_version)
+    if not index or not meta:
+        report["checks"].append({"name": "index_loaded", "ok": False, "detail": "Index/meta missing"})
+        return report
+
+    report["checks"].append({"name": "index_loaded", "ok": True, "detail": f"ntotal={index.ntotal}, dim={index.d}"})
+    report["checks"].append({"name": "meta_nonempty", "ok": len(meta) > 0, "detail": f"chunks={len(meta)}"})
+
+    # run a few queries and verify results exist
+    any_hits = False
+    for q in sample_queries:
+        res = retrieve_faiss_context(q, top_k=top_k, show_debug=False)
+        ok = len(res) > 0
+        any_hits = any_hits or ok
+        report["samples"].append({
+            "query": q,
+            "ok": ok,
+            "top_pages": [r.get("page") for r in res[:top_k]],
+            "top_headings": [r.get("heading") for r in res[:top_k]],
+        })
+
+    report["checks"].append({"name": "retrieval_hits", "ok": any_hits, "detail": "At least one query returned results"})
+    report["ok"] = all(c["ok"] for c in report["checks"])
+    return report
+
+
+# -----------------------------------------------------
+# 🔁 Rebuild Knowledge Base (PDF → chunks → embeddings → FAISS)
+# Adds:
+#  - Per-page progress
+#  - Overlap+heading metadata
+#  - Batched embeddings
+#  - Build report (pages used)
+# -----------------------------------------------------
+def rebuild_knowledge_base(
+    pdf_filename: str = "8000014609_03.pdf",
+    max_words: int = 450,
+    overlap_words: int = 80,
+    embedding_model: str = "text-embedding-3-large",
+    embedding_batch_size: int = 96,
+    min_text_chars: int = 80
+) -> None:
+    api_key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None)
+    if not api_key:
+        st.error("❌ Missing OPENAI_API_KEY. Cannot rebuild KB.")
+        return
+
+    client_local = OpenAI(api_key=api_key)
+
+    base_dir = os.path.dirname(__file__)
+    pdf_path = os.path.join(base_dir, pdf_filename)
+    if not os.path.exists(pdf_path):
+        st.error(f"❌ PDF not found: {pdf_path}")
+        return
+
+    kb_dir = os.path.join(base_dir, "kb")
+    os.makedirs(kb_dir, exist_ok=True)
+    idx_out = os.path.join(kb_dir, "vaillant_joint_faiss.index")
+    meta_out = os.path.join(kb_dir, "vaillant_joint_meta.json")
+
+    # --- Read PDF
+    try:
+        reader = PdfReader(pdf_path)
+    except Exception as e:
+        st.error(f"❌ Could not open PDF: {e}")
+        return
+
+    n_pages = len(reader.pages)
+    items: List[Dict[str, Any]] = []
+    pages_used: List[int] = []
+
+    # Progress UI
+    progress = st.progress(0)
+    status = st.empty()
+
+    # --- Extract + chunk per page
+    for pnum in range(1, n_pages + 1):
+        status.write(f"📝 Processing page {pnum}/{n_pages}...")
+        try:
+            page = reader.pages[pnum - 1]
+            text = page.extract_text() or ""
+            text = _clean_text(text)
+
+            if len(text) < min_text_chars:
+                # Skip pages with near-empty extract
+                progress.progress(int((pnum / n_pages) * 40))  # first 40% for parsing
+                continue
+
+            pages_used.append(pnum)
+
+            chunk_dicts = chunk_page_text(text, max_words=max_words, overlap_words=overlap_words)
+            for ch in chunk_dicts:
+                items.append({
+                    "page": pnum,
+                    "heading": ch.get("heading"),
+                    "text": ch["text"],
+                    "image_paths": []  # keep for compatibility with your image pipeline
+                })
+
+        except Exception as e:
+            st.warning(f"⚠️ Page {pnum} failed: {e}")
+
+        progress.progress(int((pnum / n_pages) * 40))
+
+    if not items:
+        st.error("❌ No usable text chunks extracted. KB rebuild aborted.")
+        return
+
+    # --- Embeddings (batched) — 40% → 90%
+    status.write(f"🔢 Embedding {len(items)} chunks (batched)...")
+    texts = []
+    for it in items:
+        # Include heading as context to improve retrieval
+        heading = it.get("heading")
+        if heading:
+            texts.append(f"Heading: {heading}\n\n{it['text']}")
+        else:
+            texts.append(it["text"])
+
+    try:
+        mat = embed_texts_batched(
+            client_local=client_local,
+            texts=texts,
+            model=embedding_model,
+            batch_size=embedding_batch_size,
+            sleep_s=0.0
+        )
+    except Exception as e:
+        st.error(f"❌ Embedding failed: {e}")
+        return
+
+    if mat.size == 0:
+        st.error("❌ Embeddings matrix empty. KB rebuild aborted.")
+        return
+
+    faiss.normalize_L2(mat)
+
+    # --- Build FAISS index — 90% → 98%
+    status.write("📦 Building FAISS index...")
+    index = faiss.IndexFlatIP(mat.shape[1])
+    index.add(mat)
+
+    progress.progress(95)
+
+    # --- Save
+    faiss.write_index(index, idx_out)
+    with open(meta_out, "w", encoding="utf-8") as f:
+        json.dump(items, f, indent=2)
+
+    progress.progress(98)
+
+    # --- Build report
+    build_report = {
+        "pdf_path": pdf_path,
+        "pdf_pages_total": n_pages,
+        "pages_used": pages_used,
+        "chunks_total": len(items),
+        "embedding_model": embedding_model,
+        "embedding_dim": int(mat.shape[1]),
+        "chunking": {"max_words": max_words, "overlap_words": overlap_words},
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+    }
+    st.session_state.kb_last_build_report = build_report
+
+    progress.progress(100)
+    status.write("✅ Knowledge base rebuild complete.")
+
+
+# -----------------------------------------------------
+# 🔁 Automatic rebuild on page open (only when needed)
+# -----------------------------------------------------
+def auto_rebuild_kb_on_open(
+    pdf_filename: str = "8000014609_03.pdf",
+) -> None:
+    base_dir = os.path.dirname(__file__)
+    pdf_path = os.path.join(base_dir, pdf_filename)
+
+    kb_dir = os.path.join(base_dir, "kb")
+    idx_path = os.path.join(kb_dir, "vaillant_joint_faiss.index")
+    meta_path = os.path.join(kb_dir, "vaillant_joint_meta.json")
+
+    if not os.path.exists(pdf_path):
+        st.warning("⚠️ Manual PDF not found – skipping KB rebuild.")
+        return
+
+    pdf_mtime = os.path.getmtime(pdf_path)
+    kb_exists = os.path.exists(idx_path) and os.path.exists(meta_path)
+
+    needs_rebuild = (not kb_exists) or (st.session_state.pdf_mtime != pdf_mtime)
+
+    if needs_rebuild:
+        with st.spinner("📘 Building knowledge base (auto) — first load may take a bit..."):
+            rebuild_knowledge_base(pdf_filename=pdf_filename)
+
+        # Update state
+        st.session_state.pdf_mtime = pdf_mtime
+        st.session_state.kb_version += 1
+
+        # Clear cached FAISS so next load uses new files
+        st.cache_resource.clear()
+
+        # Self-test right after rebuild
+        st.session_state.kb_last_selftest = kb_self_test()
+
+        st.success("✅ Knowledge base rebuilt automatically.")
+        st.rerun()
+    else:
+        # Optionally run a light self-test once per session
+        if not st.session_state.get("kb_selftest_done", False):
+            st.session_state.kb_last_selftest = kb_self_test()
+            st.session_state.kb_selftest_done = True
+
+
+# -----------------------------------------------------
+# 🔍 UI helper: show build report + self-test
+# (Call this anywhere you want; sidebar is a good place.)
+# -----------------------------------------------------
+def show_kb_diagnostics_ui():
+    report = st.session_state.get("kb_last_build_report", {})
+    test = st.session_state.get("kb_last_selftest", {})
+
+    with st.expander("📘 Knowledge Base Diagnostics", expanded=False):
+        st.write(f"KB Version: **{st.session_state.kb_version}**")
+
+        if report:
+            st.markdown("### 🔍 Pages used")
+            pages_used = report.get("pages_used", [])
+            st.write(f"- PDF pages total: **{report.get('pdf_pages_total')}**")
+            st.write(f"- Pages used (text extracted): **{len(pages_used)}**")
+            st.write(f"- Page list: {pages_used[:80]}{' ...' if len(pages_used) > 80 else ''}")
+
+            st.markdown("### 🧠 Chunking")
+            ch = report.get("chunking", {})
+            st.write(f"- max_words: **{ch.get('max_words')}**")
+            st.write(f"- overlap_words: **{ch.get('overlap_words')}**")
+            st.write(f"- chunks_total: **{report.get('chunks_total')}**")
+
+            st.markdown("### ⚡ Embeddings")
+            st.write(f"- model: **{report.get('embedding_model')}**")
+            st.write(f"- dim: **{report.get('embedding_dim')}**")
+            st.write(f"- built: **{report.get('timestamp')}**")
+        else:
+            st.info("No build report yet (KB may already exist and not have rebuilt this session).")
+
+        st.markdown("### 🧪 Self-test")
+        if test:
+            st.write(f"Overall: {'✅ PASS' if test.get('ok') else '❌ FAIL'}")
+            for c in test.get("checks", []):
+                st.write(f"- {c['name']}: {'✅' if c['ok'] else '❌'} — {c.get('detail','')}")
+            st.markdown("#### Sample queries")
+            for s in test.get("samples", []):
+                st.write(
+                    f"- **{s['query']}**: {'✅' if s['ok'] else '❌'} "
+                    f"(pages: {s.get('top_pages')})"
+                )
+        else:
+            st.info("Self-test not run yet.")
+
+
+
 
 
 # --- Logo ---
@@ -1134,6 +1656,9 @@ def main():
     10, 80, 45, 1, key="param_initial_temp"
 )
         
+        if not st.session_state.kb_checked:
+            auto_rebuild_kb_on_open(pdf_filename="8000014609_03.pdf")
+            st.session_state.kb_checked = True
 
         # Continue with Knowledge Base section...
 
