@@ -2413,8 +2413,19 @@ def retrieve_faiss_context(query: str, top_k: int = 3, show_debug: bool = False)
             st.code(traceback.format_exc())
         return []
 
-def rebuild_knowledge_base():
-    """Streamlit-safe PDF → text + images → embeddings → FAISS"""
+def rebuild_knowledge_base(
+    pdf_filename: str = None,
+    pdf_name: str = None,
+):
+    """
+    Streamlit-safe PDF → text + images → embeddings → FAISS
+    SAFETY: accepts pdf_filename OR pdf_name
+    """
+
+    # -------------------------------
+    # ✅ SAFETY RESOLUTION
+    # -------------------------------
+    pdf_filename = pdf_filename or pdf_name or "8000014609_03.pdf"
 
     st.info("📘 Starting knowledge base rebuild…")
 
@@ -2422,10 +2433,93 @@ def rebuild_knowledge_base():
         st.error("❌ Missing OpenAI API key.")
         return
 
-    pdf_path = os.path.join(os.path.dirname(__file__), "8000014609_03.pdf")
+    pdf_path = os.path.join(os.path.dirname(__file__), pdf_filename)
     if not os.path.exists(pdf_path):
         st.error(f"❌ PDF not found: {pdf_path}")
         return
+
+    # ---------- Open PDF ----------
+    try:
+        reader = PdfReader(pdf_path)
+    except Exception as e:
+        st.error(f"❌ Could not open PDF for text: {e}")
+        return
+
+    # ---------- Optional image extraction ----------
+    doc = None
+    if FITZ_AVAILABLE:
+        try:
+            doc = fitz.open(pdf_path)
+        except Exception as e:
+            st.warning(f"⚠️ Image extraction disabled: {e}")
+
+    items = []
+    page_images = {}
+
+    # ---------- Extract TEXT ----------
+    for pnum, page in enumerate(reader.pages, start=1):
+        try:
+            text = page.extract_text()
+            if text and len(text.strip()) > 50:
+                items.append({
+                    "page": pnum,
+                    "text": text.strip(),
+                    "image_paths": []
+                })
+        except Exception as e:
+            st.warning(f"⚠️ Text extraction failed on page {pnum}: {e}")
+
+    # ---------- Extract IMAGES ----------
+    if doc:
+        kb_dir = os.path.join(os.path.dirname(__file__), "kb")
+        img_dir = os.path.join(kb_dir, "diagrams")
+        os.makedirs(img_dir, exist_ok=True)
+
+        for pnum, page in enumerate(doc, start=1):
+            try:
+                for i, img in enumerate(page.get_images(full=True)):
+                    xref = img[0]
+                    base = doc.extract_image(xref)
+                    if base["width"] < 50 or base["height"] < 50:
+                        continue
+
+                    fname = f"page_{pnum}_img_{i}.{base['ext']}"
+                    out_path = os.path.join(img_dir, fname)
+                    with open(out_path, "wb") as f:
+                        f.write(base["image"])
+
+                    page_images.setdefault(pnum, []).append(out_path)
+            except Exception as e:
+                st.warning(f"⚠️ Image extraction failed for page {pnum}: {e}")
+
+    # ---------- Attach images ----------
+    for it in items:
+        it["image_paths"] = page_images.get(it["page"], [])
+
+    # ---------- Embeddings ----------
+    vectors = []
+    for item in items:
+        r = client.embeddings.create(
+            model="text-embedding-3-large",
+            input=item["text"]
+        )
+        vectors.append(np.array(r.data[0].embedding, dtype="float32"))
+
+    mat = np.vstack(vectors)
+    faiss.normalize_L2(mat)
+
+    index = faiss.IndexFlatIP(mat.shape[1])
+    index.add(mat)
+
+    kb_dir = os.path.join(os.path.dirname(__file__), "kb")
+    os.makedirs(kb_dir, exist_ok=True)
+
+    faiss.write_index(index, os.path.join(kb_dir, "vaillant_joint_faiss.index"))
+    with open(os.path.join(kb_dir, "vaillant_joint_meta.json"), "w") as f:
+        json.dump(items, f, indent=2)
+
+    st.success("🎉 Knowledge base rebuilt successfully!")
+
 
     # ---------- Open PDF (text always works) ----------
     try:
