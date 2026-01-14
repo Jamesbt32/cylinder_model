@@ -2447,52 +2447,38 @@ def rebuild_knowledge_base(
         st.error(f"❌ Could not open PDF for text: {e}")
         return
 
-    # ---------- Optional image extraction ----------
-    doc = None
-    if FITZ_AVAILABLE:
+    # --------------------------------------------------
+    # 📷 Extract images (RELATIVE PATH SAFE)
+    # --------------------------------------------------
+    base_dir = os.path.dirname(__file__)
+    kb_dir = os.path.join(base_dir, "kb")
+    img_dir = os.path.join(kb_dir, "diagrams")
+    os.makedirs(img_dir, exist_ok=True)
+
+    for pnum, page in enumerate(doc, start=1):
         try:
-            doc = fitz.open(pdf_path)
+            for i, img in enumerate(page.get_images(full=True)):
+                xref = img[0]
+                base = doc.extract_image(xref)
+
+                if base["width"] < 50 or base["height"] < 50:
+                    continue
+
+                ext = base["ext"]
+                fname = f"page_{pnum}_img_{i}.{ext}"
+
+                # ABSOLUTE PATH (write file)
+                abs_path = os.path.join(img_dir, fname)
+                with open(abs_path, "wb") as f:
+                    f.write(base["image"])
+
+                # ✅ RELATIVE PATH (store in FAISS metadata)
+                rel_path = os.path.join("kb", "diagrams", fname)
+                page_images.setdefault(pnum, []).append(rel_path)
+
         except Exception as e:
-            st.warning(f"⚠️ Image extraction disabled: {e}")
+            st.warning(f"⚠️ Image extraction failed on page {pnum}: {e}")
 
-    items = []
-    page_images = {}
-
-    # ---------- Extract TEXT ----------
-    for pnum, page in enumerate(reader.pages, start=1):
-        try:
-            text = page.extract_text()
-            if text and len(text.strip()) > 50:
-                items.append({
-                    "page": pnum,
-                    "text": text.strip(),
-                    "image_paths": []
-                })
-        except Exception as e:
-            st.warning(f"⚠️ Text extraction failed on page {pnum}: {e}")
-
-    # ---------- Extract IMAGES ----------
-    if doc:
-        kb_dir = os.path.join(os.path.dirname(__file__), "kb")
-        img_dir = os.path.join(kb_dir, "diagrams")
-        os.makedirs(img_dir, exist_ok=True)
-
-        for pnum, page in enumerate(doc, start=1):
-            try:
-                for i, img in enumerate(page.get_images(full=True)):
-                    xref = img[0]
-                    base = doc.extract_image(xref)
-                    if base["width"] < 50 or base["height"] < 50:
-                        continue
-
-                    fname = f"page_{pnum}_img_{i}.{base['ext']}"
-                    out_path = os.path.join(img_dir, fname)
-                    with open(out_path, "wb") as f:
-                        f.write(base["image"])
-
-                    page_images.setdefault(pnum, []).append(out_path)
-            except Exception as e:
-                st.warning(f"⚠️ Image extraction failed for page {pnum}: {e}")
 
     # ---------- Attach images ----------
     for it in items:
@@ -2795,21 +2781,15 @@ if __name__ == "__main__":
     # --------------------------------------------------------------
     def resolve_images_for_item(item):
         images = []
-        
-        if "image_paths" in item and item["image_paths"]:
-            for p in item["image_paths"]:
-                if os.path.exists(p):
-                    images.append(p)
-        
-        if not images:
-            base_dir = "manual_images"
-            if os.path.exists(base_dir):
-                for root, _, files in os.walk(base_dir):
-                    for f in files:
-                        if str(item.get("page")) in f and f.lower().endswith((".png", ".jpg", ".jpeg")):
-                            images.append(os.path.join(root, f))
-        
-        return sorted(set(images))
+        base_dir = os.path.dirname(__file__)
+
+        for rel_path in item.get("image_paths", []):
+            abs_path = os.path.join(base_dir, rel_path)
+            if os.path.exists(abs_path):
+                images.append(abs_path)
+
+        return images
+
 
     # --------------------------------------------------------------
     # Helper: Score responses using ML model
