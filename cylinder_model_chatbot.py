@@ -490,7 +490,8 @@ def auto_rebuild_kb_on_open(
 
     if needs_rebuild:
         with st.spinner("📘 Building knowledge base (auto) — first load may take a bit..."):
-            rebuild_knowledge_base(pdf_filename=pdf_filename)
+            rebuild_knowledge_base(pdf_name=pdf_filename)
+
 
         # Update state
         st.session_state.pdf_mtime = pdf_mtime
