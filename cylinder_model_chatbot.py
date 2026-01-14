@@ -326,20 +326,27 @@ def kb_self_test(sample_queries: List[str] = None, top_k: int = 3) -> Dict[str, 
 
 # -----------------------------------------------------
 # 🔁 Rebuild Knowledge Base (PDF → chunks → embeddings → FAISS)
-# Adds:
-#  - Per-page progress
-#  - Overlap+heading metadata
-#  - Batched embeddings
-#  - Build report (pages used)
+# SAFE VERSION: accepts pdf_filename OR pdf_name
 # -----------------------------------------------------
 def rebuild_knowledge_base(
-    pdf_filename: str = "8000014609_03.pdf",
+    pdf_filename: str = None,
+    pdf_name: str = None,
     max_words: int = 450,
     overlap_words: int = 80,
     embedding_model: str = "text-embedding-3-large",
     embedding_batch_size: int = 96,
-    min_text_chars: int = 80
+    min_text_chars: int = 80,
 ) -> None:
+    """
+    Rebuilds the FAISS knowledge base from a PDF.
+    SAFETY: accepts both pdf_filename and pdf_name to avoid caller mismatch bugs.
+    """
+
+    # -------------------------------
+    # ✅ SAFETY RESOLUTION
+    # -------------------------------
+    pdf_filename = pdf_filename or pdf_name or "8000014609_03.pdf"
+
     api_key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None)
     if not api_key:
         st.error("❌ Missing OPENAI_API_KEY. Cannot rebuild KB.")
@@ -349,16 +356,20 @@ def rebuild_knowledge_base(
 
     base_dir = os.path.dirname(__file__)
     pdf_path = os.path.join(base_dir, pdf_filename)
+
     if not os.path.exists(pdf_path):
         st.error(f"❌ PDF not found: {pdf_path}")
         return
 
     kb_dir = os.path.join(base_dir, "kb")
     os.makedirs(kb_dir, exist_ok=True)
+
     idx_out = os.path.join(kb_dir, "vaillant_joint_faiss.index")
     meta_out = os.path.join(kb_dir, "vaillant_joint_meta.json")
 
-    # --- Read PDF
+    # -------------------------------
+    # 📘 Open PDF
+    # -------------------------------
     try:
         reader = PdfReader(pdf_path)
     except Exception as e:
@@ -366,14 +377,15 @@ def rebuild_knowledge_base(
         return
 
     n_pages = len(reader.pages)
-    items: List[Dict[str, Any]] = []
-    pages_used: List[int] = []
+    items = []
+    pages_used = []
 
-    # Progress UI
     progress = st.progress(0)
     status = st.empty()
 
-    # --- Extract + chunk per page
+    # -------------------------------
+    # 🧠 Extract + chunk text
+    # -------------------------------
     for pnum in range(1, n_pages + 1):
         status.write(f"📝 Processing page {pnum}/{n_pages}...")
         try:
@@ -382,19 +394,24 @@ def rebuild_knowledge_base(
             text = _clean_text(text)
 
             if len(text) < min_text_chars:
-                # Skip pages with near-empty extract
-                progress.progress(int((pnum / n_pages) * 40))  # first 40% for parsing
+                progress.progress(int((pnum / n_pages) * 40))
                 continue
 
             pages_used.append(pnum)
 
-            chunk_dicts = chunk_page_text(text, max_words=max_words, overlap_words=overlap_words)
+            chunk_dicts = chunk_page_text(
+                text,
+                max_words=max_words,
+                overlap_words=overlap_words,
+            )
+
             for ch in chunk_dicts:
                 items.append({
                     "page": pnum,
                     "heading": ch.get("heading"),
                     "text": ch["text"],
-                    "image_paths": []  # keep for compatibility with your image pipeline
+                    "image_paths": [],        # images added later
+                    "figure_captions": []     # ready for caption support
                 })
 
         except Exception as e:
@@ -403,17 +420,18 @@ def rebuild_knowledge_base(
         progress.progress(int((pnum / n_pages) * 40))
 
     if not items:
-        st.error("❌ No usable text chunks extracted. KB rebuild aborted.")
+        st.error("❌ No usable text extracted. KB rebuild aborted.")
         return
 
-    # --- Embeddings (batched) — 40% → 90%
-    status.write(f"🔢 Embedding {len(items)} chunks (batched)...")
+    # -------------------------------
+    # ⚡ Embeddings (batched)
+    # -------------------------------
+    status.write(f"🔢 Embedding {len(items)} chunks...")
     texts = []
+
     for it in items:
-        # Include heading as context to improve retrieval
-        heading = it.get("heading")
-        if heading:
-            texts.append(f"Heading: {heading}\n\n{it['text']}")
+        if it.get("heading"):
+            texts.append(f"Heading: {it['heading']}\n\n{it['text']}")
         else:
             texts.append(it["text"])
 
@@ -423,51 +441,51 @@ def rebuild_knowledge_base(
             texts=texts,
             model=embedding_model,
             batch_size=embedding_batch_size,
-            sleep_s=0.0
         )
     except Exception as e:
         st.error(f"❌ Embedding failed: {e}")
         return
 
     if mat.size == 0:
-        st.error("❌ Embeddings matrix empty. KB rebuild aborted.")
+        st.error("❌ Embedding matrix empty.")
         return
 
     faiss.normalize_L2(mat)
 
-    # --- Build FAISS index — 90% → 98%
+    # -------------------------------
+    # 📦 Build FAISS index
+    # -------------------------------
     status.write("📦 Building FAISS index...")
     index = faiss.IndexFlatIP(mat.shape[1])
     index.add(mat)
 
     progress.progress(95)
 
-    # --- Save
     faiss.write_index(index, idx_out)
     with open(meta_out, "w", encoding="utf-8") as f:
         json.dump(items, f, indent=2)
 
-    progress.progress(98)
+    progress.progress(100)
 
-    # --- Build report
-    build_report = {
-        "pdf_path": pdf_path,
-        "pdf_pages_total": n_pages,
+    # -------------------------------
+    # 📊 Build report
+    # -------------------------------
+    st.session_state.kb_last_build_report = {
+        "pdf": pdf_filename,
+        "pages_total": n_pages,
         "pages_used": pages_used,
         "chunks_total": len(items),
         "embedding_model": embedding_model,
         "embedding_dim": int(mat.shape[1]),
-        "chunking": {"max_words": max_words, "overlap_words": overlap_words},
-        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
-    st.session_state.kb_last_build_report = build_report
 
-    progress.progress(100)
-    status.write("✅ Knowledge base rebuild complete.")
+    st.success("✅ Knowledge base rebuild complete.")
+
 
 
 # -----------------------------------------------------
-# 🔁 Automatic rebuild on page open (only when needed)
+# 🔁 Automatic rebuild on page open (safe)
 # -----------------------------------------------------
 def auto_rebuild_kb_on_open(
     pdf_filename: str = "8000014609_03.pdf",
@@ -489,28 +507,16 @@ def auto_rebuild_kb_on_open(
     needs_rebuild = (not kb_exists) or (st.session_state.pdf_mtime != pdf_mtime)
 
     if needs_rebuild:
-        with st.spinner("📘 Building knowledge base (auto) — first load may take a bit..."):
-            rebuild_knowledge_base(pdf_name=pdf_filename)
+        with st.spinner("📘 Building knowledge base (auto)..."):
+            rebuild_knowledge_base(pdf_filename=pdf_filename)
 
-
-
-        # Update state
         st.session_state.pdf_mtime = pdf_mtime
         st.session_state.kb_version += 1
-
-        # Clear cached FAISS so next load uses new files
         st.cache_resource.clear()
-
-        # Self-test right after rebuild
-        st.session_state.kb_last_selftest = kb_self_test()
 
         st.success("✅ Knowledge base rebuilt automatically.")
         st.rerun()
-    else:
-        # Optionally run a light self-test once per session
-        if not st.session_state.get("kb_selftest_done", False):
-            st.session_state.kb_last_selftest = kb_self_test()
-            st.session_state.kb_selftest_done = True
+
 
 
 # -----------------------------------------------------
@@ -3052,6 +3058,4 @@ if __name__ == "__main__":
                         else:
                             st.warning("⚠️ Need at least 5 feedback samples to train")
         else:
-
             st.info("No feedback collected yet. Rate some responses to start training!")
-
