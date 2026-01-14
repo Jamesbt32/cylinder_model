@@ -490,7 +490,7 @@ def auto_rebuild_kb_on_open(
 
     if needs_rebuild:
         with st.spinner("📘 Building knowledge base (auto) — first load may take a bit..."):
-            def rebuild_knowledge_base(pdf_filename="8000014609_03.pdf"):
+            rebuild_knowledge_base(pdf_name=pdf_filename)
 
 
 
@@ -3054,3 +3054,4 @@ if __name__ == "__main__":
         else:
 
             st.info("No feedback collected yet. Rate some responses to start training!")
+
