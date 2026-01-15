@@ -2725,11 +2725,20 @@ def save_feedback(question: str, response: str, helpful: bool, feedback_type: st
 
 def render_chatbot():
     """Render the complete chatbot interface with filtering."""
+
     
-    st.markdown("---")
-    st.markdown("---")
-    st.subheader("💬 AI Simulation Assistant")
-    st.caption("Ask about cylinder specifications, installation, or simulation behavior")
+    # Check if images exist in Streamlit Cloud
+    base_dir = os.path.dirname(__file__)
+    kb_dir = os.path.join(base_dir, "kb", "diagrams")
+    st.write(f"**KB diagrams path:** `{kb_dir}`")
+    st.write(f"**Exists:** {os.path.exists(kb_dir)}")
+    if os.path.exists(kb_dir):
+        files = os.listdir(kb_dir)
+        st.write(f"**Files:** {len(files)}")    
+        st.markdown("---")
+        st.markdown("---")
+        st.subheader("💬 AI Simulation Assistant")
+        st.caption("Ask about cylinder specifications, installation, or simulation behavior")
     
     if "chatbot_response" not in st.session_state:
         st.session_state.chatbot_response = None
@@ -2936,12 +2945,29 @@ Provide a clear, technical answer based on the context above.
                     st.metric("Images After", stats.get("filtered_images", "N/A"))
         
         if data_mode.startswith("Manual") and st.session_state.retrieved_items:
-            
+    
             st.markdown("---")
             st.markdown("### 📷 Related Technical Diagrams")
             
-            total_images_shown = 0
+            # 🔍 DEBUG: Show what we retrieved
+            with st.expander("🐛 DEBUG: Retrieved Items", expanded=True):
+                st.write(f"**Total items retrieved:** {len(st.session_state.retrieved_items)}")
+                
+                for idx, item in enumerate(st.session_state.retrieved_items):
+                    st.write(f"**Item {idx + 1}:**")
+                    st.write(f"- Page: {item.get('page')}")
+                    st.write(f"- Similarity: {item.get('similarity', 0):.3f}")
+                    st.write(f"- Image paths in metadata: {item.get('image_paths', [])}")
+                    
+                    # Check if images actually exist
+                    images = resolve_images_for_item(item)
+                    st.write(f"- Resolved images: {images}")
+                    
+                    for img_path in images:
+                        exists = os.path.exists(img_path)
+                        st.write(f"  - {img_path}: {'✅ EXISTS' if exists else '❌ MISSING'}")
             
+            total_images_shown = 0
             for item_idx, item in enumerate(st.session_state.retrieved_items):
                 page_num = item.get("page", "?")
                 
@@ -3043,6 +3069,7 @@ Provide a clear, technical answer based on the context above.
             st.dataframe(display_df, use_container_width=True, hide_index=True)
         else:
             st.info("No feedback collected yet. Rate some responses to start tracking!")
+
 
 
 # ==============================================================
