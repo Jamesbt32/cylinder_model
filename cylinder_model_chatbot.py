@@ -345,7 +345,7 @@ def rebuild_knowledge_base(
     # -------------------------------
     # ✅ SAFETY RESOLUTION
     # -------------------------------
-    pdf_filename = pdf_filename or pdf_name or "8000014609_03.pdf"
+    pdf_filename = pdf_filename or pdf_name or r"https://github.com/Jamesbt32/cylinder_model/blob/Chatbot/8000014609_03.pdf"
 
     api_key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None)
     if not api_key:
@@ -490,7 +490,7 @@ def rebuild_knowledge_base(
 # 🔁 Automatic rebuild on page open (safe)
 # -----------------------------------------------------
 def auto_rebuild_kb_on_open(
-    pdf_filename: str = "8000014609_03.pdf",
+    pdf_filename: str = r"https://github.com/Jamesbt32/cylinder_model/blob/Chatbot/8000014609_03.pdf",
 ) -> None:
     base_dir = os.path.dirname(__file__)
     pdf_path = os.path.join(base_dir, pdf_filename)
@@ -1667,7 +1667,7 @@ def main():
 )
         
         if not st.session_state.kb_checked:
-            auto_rebuild_kb_on_open(pdf_filename="8000014609_03.pdf")
+            auto_rebuild_kb_on_open(pdf_filename=r"https://github.com/Jamesbt32/cylinder_model/blob/Chatbot/8000014609_03.pdf")
             st.session_state.kb_checked = True
 
         # Continue with Knowledge Base section...
@@ -3077,4 +3077,5 @@ Provide a clear, technical answer based on the context above.
 # ==============================================================
 if __name__ == "__main__":
     main()
+
     render_chatbot()
