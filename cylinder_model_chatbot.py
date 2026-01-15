@@ -2592,32 +2592,31 @@ def resolve_images_for_item(item: Dict) -> List[str]:
 def filter_retrieved_items(items: List[Dict], query: str) -> List[Dict]:
     """
     Filter out low-relevance items from retrieval results.
-    AGGRESSIVE: Removes QR codes, logos, blank pages, watermarks, and branding images.
+    BALANCED: Removes obvious noise while keeping technical diagrams.
     """
     filtered = []
     
     for item in items:
-        # Stricter similarity threshold
-        if item.get("similarity", 0) < 0.30:
+        # RELAXED similarity threshold (was 0.30, now 0.25)
+        if item.get("similarity", 0) < 0.25:
             continue
         
         item_text = item.get("text", "")
         
-        # Check if text content is blank/watermark
+        # Check if text content is blank/watermark (keep this)
         if is_blank_page(item_text) or detect_watermark_text(item_text):
             continue
         
-        # Filter images
+        # Filter images - MORE LENIENT
         images = resolve_images_for_item(item)
         relevant_images = []
         
         for img_path in images:
             try:
-                # Quick filename check - EXPANDED
+                # Quick filename check - ONLY obvious noise
                 filename_lower = os.path.basename(img_path).lower()
                 if any(keyword in filename_lower for keyword in [
-                    'benchmark', 'logo', 'qr', 'barcode', 'watermark',
-                    'mark', 'brand', 'footer', 'header'
+                    'benchmark', 'logo', 'qr', 'barcode'
                 ]):
                     continue
                 
@@ -2627,54 +2626,68 @@ def filter_retrieved_items(items: List[Dict], query: str) -> List[Dict]:
                     img = Image.open(img_path)
                     width, height = img.size
                     
-                    # STRICTER size filtering
-                    if width < 250 or height < 250:
+                    # RELAXED size filtering (was 250, now 150)
+                    if width < 150 or height < 150:
                         continue
                     
-                    # STRICTER aspect ratio filtering for QR codes
+                    # RELAXED aspect ratio filtering
                     aspect_ratio = width / height
                     
-                    # Nearly square images under 600px are likely QR codes/logos
-                    if 0.90 < aspect_ratio < 1.10:
-                        if width < 600:
+                    # Only reject VERY square + VERY small (QR codes)
+                    if 0.95 < aspect_ratio < 1.05:  # Nearly perfect square
+                        if width < 300:  # And small
                             continue
                     
-                    # Very wide or tall images might be headers/footers
-                    if aspect_ratio > 4.0 or aspect_ratio < 0.25:
+                    # Keep most aspect ratios (was 4.0/0.25, now 6.0/0.15)
+                    if aspect_ratio > 6.0 or aspect_ratio < 0.15:
                         continue
                         
                 except Exception:
+                    # On dimension error, keep the image
                     pass
                 
-                # OCR check if available
+                # OCR check - MORE FORGIVING
                 ocr_text = extract_text_from_image(img_path)
                 
-                if not ocr_text.startswith("["):
-                    # IMMEDIATE rejection for QR codes
+                if not ocr_text.startswith("["):  # OCR succeeded
+                    # IMMEDIATE rejection only for OBVIOUS QR codes
                     if detect_qr_code_patterns(ocr_text):
                         continue
                     
-                    # IMMEDIATE rejection for watermarks
+                    # IMMEDIATE rejection only for PURE watermarks
                     if detect_watermark_text(ocr_text):
-                        continue
+                        # Double-check: if has technical words, keep it anyway
+                        if not any(word in ocr_text.lower() for word in [
+                            'cylinder', 'pump', 'valve', 'temperature', 
+                            'pressure', 'flow', 'heating', 'installation',
+                            'wiring', 'diagram', 'mm', 'bar', 'kw'
+                        ]):
+                            continue
                     
-                    # STRICTER content requirements
-                    if has_sufficient_content(ocr_text, min_words=5):
+                    # RELAXED content requirements (was 5 words, now 3)
+                    if has_sufficient_content(ocr_text, min_words=3):
                         relevant_images.append(img_path)
+                    else:
+                        # Even if insufficient text, keep if it's a large image
+                        # (likely a technical diagram with minimal text)
+                        if width >= 400 and height >= 400:
+                            relevant_images.append(img_path)
                 else:
-                    # OCR not available - only keep if dimensions pass stricter tests
-                    if width >= 300 and height >= 300:
+                    # OCR not available - KEEP BY DEFAULT if size OK
+                    if width >= 200 and height >= 200:
+                        # Only reject if nearly square AND small
                         aspect_ratio = width / height
-                        if not (0.90 < aspect_ratio < 1.10):
+                        if not (0.95 < aspect_ratio < 1.05 and width < 300):
                             relevant_images.append(img_path)
                     
-            except Exception:
-                pass
+            except Exception as e:
+                # On any error, KEEP the image (was reject, now keep)
+                relevant_images.append(img_path)
         
         # Update item with filtered images
         item["image_paths"] = relevant_images
         
-        # Only keep items with text OR relevant images
+        # Keep items with text OR images (more lenient)
         if item.get("text") or relevant_images:
             filtered.append(item)
     
