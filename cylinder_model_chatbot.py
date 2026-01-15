@@ -2212,11 +2212,14 @@ def main():
 # ============================
 RHO = 1000
 CP = 4186
-
 BUFFER_RHO = 1000
 BUFFER_CP = 4186
-
 P_EL_MAX = 5000
+
+FEEDBACK_FILE = "chat_feedback.csv"
+MODEL_FILE = "ml_feedback_model.pkl"
+VEC_FILE = "ml_feedback_vectorizer.pkl"
+RETRAIN_THRESHOLD = 5
 
 
 # -----------------------------------------------------
@@ -2233,16 +2236,9 @@ def typewriter_effect(text: str, speed: float = 0.02):
     return placeholder
 
 
-summary = st.session_state.get("summary", {})
-
 # -----------------------------------------------------
-# 🤖 Learning Chatbot Feedback + Retraining
+# 🤖 Learning Chatbot Feedback Functions
 # -----------------------------------------------------
-FEEDBACK_FILE = "chat_feedback.csv"
-MODEL_FILE = "ml_feedback_model.pkl"
-VEC_FILE = "ml_feedback_vectorizer.pkl"
-RETRAIN_THRESHOLD = 5
-
 def train_feedback_model(df: pd.DataFrame):
     if len(df) < 5:
         return None, None
@@ -2255,14 +2251,15 @@ def train_feedback_model(df: pd.DataFrame):
     joblib.dump(model, MODEL_FILE)
     return vec, model
 
-@st.cache_data(ttl=60)  # Cache for 60 seconds to balance freshness and speed
+
+@st.cache_data(ttl=60)
 def load_feedback_data():
+    """Load feedback data from CSV."""
     if os.path.exists(FEEDBACK_FILE):
         return pd.read_csv(FEEDBACK_FILE)
     else:
-        return pd.DataFrame(columns=["timestamp", "question", "response", "helpful"])
-    
-    
+        return pd.DataFrame(columns=["timestamp", "question", "response", "helpful", "type"])
+
 
 # --------------------------------------------------------
 # 🔧 Environment setup
@@ -2270,463 +2267,457 @@ def load_feedback_data():
 os.environ["PYVISTA_OFF_SCREEN"] = "true"
 os.environ["PYVISTA_USE_PANEL"] = "false"
 
-# --------------------------------------------------------
-# 🔑 OpenAI client - DEBUG VERSION
-# --------------------------------------------------------
-st.write("🔍 DEBUG: Checking API Key...")
-st.write(f"Current working directory: {os.getcwd()}")
-st.write(f"Script directory: {os.path.dirname(__file__)}")
 
-# Check if secrets file exists
-secrets_path = os.path.join(os.path.dirname(__file__), ".streamlit", "secrets.toml")
-st.write(f"Looking for secrets at: {secrets_path}")
-st.write(f"Secrets file exists: {os.path.exists(secrets_path)}")
+# ==============================================================
+# 🔍 ENHANCED IMAGE FILTERING HELPERS (CORRECT ORDER)
+# ==============================================================
 
-# Try to load the key
-try:
-    API_KEY = st.secrets.get("OPENAI_API_KEY", None)
-    st.write(f"Key from st.secrets: {'Found' if API_KEY else 'Not found'}")
-    if API_KEY:
-        st.write(f"Key starts with: {API_KEY[:7]}...")
-except Exception as e:
-    st.error(f"Error reading secrets: {e}")
-    API_KEY = None
-
-# Fallback to environment variable
-if not API_KEY:
-    API_KEY = os.getenv("OPENAI_API_KEY")
-    st.write(f"Key from environment: {'Found' if API_KEY else 'Not found'}")
-
-if not API_KEY:
-    st.warning("⚠️ OPENAI_API_KEY not found. Please add it to Streamlit secrets or environment.")
-    client = None
-else:
-    client = OpenAI(api_key=API_KEY)
-    st.success("✅ OpenAI client initialized!")
-
-
-
-# --------------------------------------------------------
-# 📂 Load FAISS index + metadata
-# --------------------------------------------------------
-@st.cache_resource
-def load_faiss_index():
+def is_blank_page(text: str, min_chars: int = 50, min_words: int = 10) -> bool:
     """
-    Load the FAISS index and associated metadata (manual chunks + images).
-    Returns (index, metadata) or (None, None) if files are missing.
+    Check if page is essentially blank or contains only headers/footers.
+    Returns True if blank (should be FILTERED OUT).
     """
-    # Try multiple possible paths
-    possible_paths = [
-        # Absolute path (original)
-        (r"C:\Users\james\OneDrive\Documents\Python\kb\vaillant_joint_faiss.index",
-         r"C:\Users\james\OneDrive\Documents\Python\kb\vaillant_joint_meta.json"),
-        # Relative to script
-        (os.path.join(os.path.dirname(__file__), "kb", "vaillant_joint_faiss.index"),
-         os.path.join(os.path.dirname(__file__), "kb", "vaillant_joint_meta.json")),
-        # Current directory
-        (os.path.join("kb", "vaillant_joint_faiss.index"),
-         os.path.join("kb", "vaillant_joint_meta.json")),
+    if not text:
+        return True
+    
+    cleaned = text.strip()
+    
+    if len(cleaned) < min_chars:
+        return True
+    
+    words = cleaned.split()
+    if len(words) < min_words:
+        return True
+    
+    if all(word.replace('.', '').replace(',', '').isdigit() for word in words):
+        return True
+    
+    unique_words = set(words)
+    if len(unique_words) < len(words) * 0.5:
+        return True
+    
+    return False
+
+
+def detect_qr_code_patterns(ocr_text: str) -> bool:
+    """
+    Detect if text contains QR code patterns or URLs typical in QR codes.
+    Returns True if QR code is detected (should be FILTERED OUT).
+    """
+    if not ocr_text:
+        return False
+    
+    text_lower = ocr_text.lower().strip()
+    
+    # QR codes often have very little text or specific patterns
+    qr_indicators = [
+        'http://' in text_lower,
+        'https://' in text_lower,
+        'www.' in text_lower,
+        'scan' in text_lower,
+        'qr code' in text_lower,
+        'barcode' in text_lower,
+        # Very short text indicates QR code
+        len(text_lower.split()) < 5 and len(text_lower) < 50,
+        # QR codes often have random alphanumeric strings
+        any(len(word) > 20 and word.isalnum() for word in text_lower.split()),
     ]
     
-    INDEX_PATH = None
-    META_PATH = None
-    
-    # Find first existing path
-    for idx_path, meta_path in possible_paths:
-        if os.path.exists(idx_path) and os.path.exists(meta_path):
-            INDEX_PATH = idx_path
-            META_PATH = meta_path
-            break
-    
-    if not INDEX_PATH or not META_PATH:
-        st.warning("⚠️ Knowledge base not found. Please rebuild it using the sidebar button.")
-        return None, None
+    return any(qr_indicators)
 
-    try:
-        index = faiss.read_index(INDEX_PATH)
-        with open(META_PATH, "r", encoding="utf-8") as f:
-            meta = json.load(f)
-        return index, meta
-    except Exception as e:
-        st.error(f"❌ Failed to load FAISS: {e}")
-        return None, None
 
-# --------------------------------------------------------
-# 🔍 Retrieve relevant manual chunks via FAISS
-# --------------------------------------------------------
-def retrieve_faiss_context(query: str, top_k: int = 3, show_debug: bool = False):
+def detect_watermark_text(text: str) -> bool:
     """
-    Retrieve the top_k most relevant manual chunks from the FAISS index
-    given a user query. Uses OpenAI embeddings for similarity search.
-    
-    Args:
-        query: The search query
-        top_k: Number of results to return
-        show_debug: If True, display debug information (for testing only)
+    Detect common watermark/branding text that should be filtered.
+    Returns True if watermark detected (should be FILTERED OUT).
     """
-    index, meta = load_faiss_index()
-    if not index or not meta:
-        if show_debug:
-            st.warning("⚠️ FAISS index not loaded. Cannot retrieve manual context.")
-        return []
-
-    api_key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None)
-    if not api_key:
-        if show_debug:
-            st.error("⚠️ Missing OPENAI_API_KEY")
-        return []
-
-    try:
-        client = OpenAI(api_key=api_key)
+    if not text:
+        return False
+    
+    text_lower = text.lower()
+    
+    # Expanded watermark patterns - VERY AGGRESSIVE
+    watermark_patterns = [
+        # Benchmark-specific
+        'benchmark',
+        'collective mark',
+        'mark of quality',
+        'compliance and best practice',
+        'commissioning, servicing and maintenance',
+        'domestic heating',
+        'water solutions',
         
-        emb_resp = client.embeddings.create(
-            model="text-embedding-3-large",
-            input=query,
-        )
-        emb_vec = np.array(emb_resp.data[0].embedding, dtype="float32").reshape(1, -1)
-        faiss.normalize_L2(emb_vec)
-
-        scores, ids = index.search(emb_vec, top_k)
-        results = []
-        for score, idx in zip(scores[0], ids[0]):
-            if 0 <= idx < len(meta):
-                item = meta[idx]
-                item["similarity"] = float(score)
-                results.append(item)
-                
-        # Only display debug info if explicitly requested
-        if show_debug and results:
-            st.success(f"✅ Found {len(results)} relevant manual sections")
-            with st.expander("📖 Retrieved Context (click to view)", expanded=False):
-                for i, item in enumerate(results, 1):
-                    st.write(f"**Chunk {i}** (Page {item.get('page', '?')}, Similarity: {item.get('similarity', 0):.3f})")
-                    st.write(item.get('text', '')[:200] + "...")
-                    if item.get('image_paths'):
-                        st.write(f"  📷 {len(item.get('image_paths', []))} images available")
-        elif show_debug and not results:
-            st.warning("⚠️ No relevant context found in knowledge base")
-            
-        return results
-
-    except Exception as e:
-        if show_debug:
-            st.error(f"⚠️ Error retrieving FAISS context: {e}")
-            import traceback
-            st.code(traceback.format_exc())
-        return []
-
-def rebuild_knowledge_base(
-    pdf_filename: str = None,
-    pdf_name: str = None,
-):
-    """
-    Streamlit-safe PDF → text + images → embeddings → FAISS
-    SAFETY: accepts pdf_filename OR pdf_name
-    """
-
-    # -------------------------------
-    # ✅ SAFETY RESOLUTION
-    # -------------------------------
-    pdf_filename = pdf_filename or pdf_name or "8000014609_03.pdf"
-
-    st.info("📘 Starting knowledge base rebuild…")
-
-    if not API_KEY or not client:
-        st.error("❌ Missing OpenAI API key.")
-        return
-
-    pdf_path = os.path.join(os.path.dirname(__file__), pdf_filename)
-    if not os.path.exists(pdf_path):
-        st.error(f"❌ PDF not found: {pdf_path}")
-        return
-
-    # ---------- Open PDF ----------
-    try:
-        reader = PdfReader(pdf_path)
-    except Exception as e:
-        st.error(f"❌ Could not open PDF for text: {e}")
-        return
-
-    # --------------------------------------------------
-    # 📷 Extract images (RELATIVE PATH SAFE)
-    # --------------------------------------------------
-    base_dir = os.path.dirname(__file__)
-    kb_dir = os.path.join(base_dir, "kb")
-    img_dir = os.path.join(kb_dir, "diagrams")
-    os.makedirs(img_dir, exist_ok=True)
-
-    for pnum, page in enumerate(doc, start=1):
-        try:
-            for i, img in enumerate(page.get_images(full=True)):
-                xref = img[0]
-                base = doc.extract_image(xref)
-
-                if base["width"] < 50 or base["height"] < 50:
-                    continue
-
-                ext = base["ext"]
-                fname = f"page_{pnum}_img_{i}.{ext}"
-
-                # ABSOLUTE PATH (write file)
-                abs_path = os.path.join(img_dir, fname)
-                with open(abs_path, "wb") as f:
-                    f.write(base["image"])
-
-                # ✅ RELATIVE PATH (store in FAISS metadata)
-                rel_path = os.path.join("kb", "diagrams", fname)
-                page_images.setdefault(pnum, []).append(rel_path)
-
-        except Exception as e:
-            st.warning(f"⚠️ Image extraction failed on page {pnum}: {e}")
-
-
-    # ---------- Attach images ----------
-    for it in items:
-        it["image_paths"] = page_images.get(it["page"], [])
-
-    # ---------- Embeddings ----------
-    vectors = []
-    for item in items:
-        r = client.embeddings.create(
-            model="text-embedding-3-large",
-            input=item["text"]
-        )
-        vectors.append(np.array(r.data[0].embedding, dtype="float32"))
-
-    mat = np.vstack(vectors)
-    faiss.normalize_L2(mat)
-
-    index = faiss.IndexFlatIP(mat.shape[1])
-    index.add(mat)
-
-    kb_dir = os.path.join(os.path.dirname(__file__), "kb")
-    os.makedirs(kb_dir, exist_ok=True)
-
-    faiss.write_index(index, os.path.join(kb_dir, "vaillant_joint_faiss.index"))
-    with open(os.path.join(kb_dir, "vaillant_joint_meta.json"), "w") as f:
-        json.dump(items, f, indent=2)
-
-    st.success("🎉 Knowledge base rebuilt successfully!")
-
-
-    # ---------- Open PDF (text always works) ----------
-    try:
-        reader = PdfReader(pdf_path)
-    except Exception as e:
-        st.error(f"❌ Could not open PDF for text: {e}")
-        return
-
-    # ---------- Open PDF for images ONLY if fitz exists ----------
-    doc = None
-    if FITZ_AVAILABLE:
-        try:
-            doc = fitz.open(pdf_path)
-        except Exception as e:
-            st.warning(f"⚠️ Image extraction disabled: {e}")
-            doc = None
-    else:
-        st.warning("⚠️ PyMuPDF not available – skipping image extraction")
-
-    items = []
-    page_images = {}
-
-    # ---------- Helper: chunk text ----------
-    def chunk_text(text, max_words=700):
-        sentences = text.split(". ")
-        chunks, buf, count = [], [], 0
-        for s in sentences:
-            buf.append(s)
-            count += len(s.split())
-            if count >= max_words:
-                chunks.append(". ".join(buf))
-                buf, count = [], 0
-        if buf:
-            chunks.append(". ".join(buf))
-        return chunks
-
-    # ---------- Extract TEXT ----------
-    st.info("📝 Extracting text…")
-
-    for pnum, page in enumerate(reader.pages, start=1):
-        try:
-            text = page.extract_text()
-            if text and len(text.strip()) > 50:
-                chunks = chunk_text(text.strip())
-                for c in chunks:
-                    items.append({
-                        "page": pnum,
-                        "text": c,
-                        "image_paths": []
-                    })
-        except Exception as e:
-            st.warning(f"⚠️ Text extraction failed on page {pnum}: {e}")
-
-    # ---------- Extract IMAGES (only if fitz is available) ----------
-    if doc:
-        st.info("🖼️ Extracting images…")
-
-        base_dir = os.path.dirname(__file__)
-        kb_dir = os.path.join(base_dir, "kb")
-        img_dir = os.path.join(kb_dir, "diagrams")
-        os.makedirs(img_dir, exist_ok=True)
-
-        for pnum, page in enumerate(doc, start=1):
-            try:
-                imgs = page.get_images(full=True)
-                if not imgs:
-                    continue
-
-                for i, img in enumerate(imgs):
-                    xref = img[0]
-                    base = doc.extract_image(xref)
-                    w = base.get("width", 0)
-                    h = base.get("height", 0)
-
-                    if w < 50 or h < 50:
-                        continue
-
-                    ext = base["ext"]
-                    fname = f"page_{pnum}_img_{i}.{ext}"
-                    out_path = os.path.join(img_dir, fname)
-
-                    with open(out_path, "wb") as f:
-                        f.write(base["image"])
-
-                    page_images.setdefault(pnum, []).append(out_path)
-
-            except Exception as e:
-                st.warning(f"⚠️ Image extraction failed for page {pnum}: {e}")
-
-    # ---------- Attach images to text chunks ----------
-    for it in items:
-        it["image_paths"] = page_images.get(it["page"], [])
-
-    st.success(f"✅ Extracted {len(items)} knowledge chunks")
-
-    # ---------- Embeddings ----------
-    st.info("🔢 Generating embeddings…")
-    vectors = []
-
-    for i, item in enumerate(items):
-        try:
-            r = client.embeddings.create(
-                model="text-embedding-3-large",
-                input=item["text"]
-            )
-            vectors.append(np.array(r.data[0].embedding, dtype="float32"))
-        except Exception as e:
-            st.warning(f"⚠️ Embedding failed for chunk {i}: {e}")
-            vectors.append(np.zeros(3072, dtype="float32"))
-
-    mat = np.vstack(vectors)
-    faiss.normalize_L2(mat)
-
-    # ---------- Save FAISS ----------
-    kb_dir = os.path.join(os.path.dirname(__file__), "kb")
-    os.makedirs(kb_dir, exist_ok=True)
-
-    index = faiss.IndexFlatIP(mat.shape[1])
-    index.add(mat)
-
-    faiss.write_index(index, os.path.join(kb_dir, "vaillant_joint_faiss.index"))
-    with open(os.path.join(kb_dir, "vaillant_joint_meta.json"), "w", encoding="utf-8") as f:
-        json.dump(items, f, indent=2)
-
-    st.success("🎉 Knowledge base rebuilt successfully!")
-
-    st.markdown("""
-    <style>
-
-    /* Fixed collapsible chat shell */
-    .chat-shell {
-        position: fixed;
-        bottom: 0;
-        left: 0;
-        width: 100%;
-        background: #0f172a;
-        border-top: 2px solid #334155;
-        z-index: 999;
-        box-shadow: 0 -4px 10px rgba(0,0,0,0.3);
-    }
-
-    /* Header bar */
-    .chat-header {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        padding: 0.75rem 1rem;
-        cursor: pointer;
-        background: #020617;
-        color: white;
-        font-weight: 600;
-    }
-
-    /* Expandable body */
-    .chat-body {
-        max-height: 0;
-        overflow: hidden;
-        transition: max-height 0.35s ease-in-out;
-        padding: 0 1rem;
-    }
-
-    /* When expanded */
-    .chat-shell.expanded .chat-body {
-        max-height: 400px;
-        padding-bottom: 1rem;
-    }
-
-    /* Prevent graphs from being hidden */
-    .block-container {
-        padding-bottom: 160px !important;
-    }
-
-    </style>
-    """, unsafe_allow_html=True)
-
-
-# --- Entry point ---
-if __name__ == "__main__":
-    main()
-
-    # ==============================================================
-    # 💬 AI CHATBOT SECTION (AFTER MAIN RUNS)
-    # ==============================================================
-
-    st.markdown("---")
-    st.markdown("---")  # Extra separator
-    st.subheader("💬 AI Simulation Assistant")
-    st.caption("Ask things like: *Why does the COP drop during tapping?* or *What is the cylinder weight?*")
-
-    # --------------------------------------------------------------
-    # User input with Ask button
-    # --------------------------------------------------------------
-    col1, col2 = st.columns([5, 1])
-    with col1:
-        query = st.text_input(
-            "Question",
-            key="user_question",
-            placeholder="Type your question here...",
-            label_visibility="collapsed",
-            help=""
-        )
-    with col2:
-        st.write("")
-        st.write("")
-        ask_button = st.button("🔍 Ask", key="btn_ask", use_container_width=True)
-
-    st.markdown("### 🧭 Data Source")
-    data_mode = st.radio(
-        "Choose how the assistant should respond:",
-        ["Manual Data (RAG from Vaillant PDF)", "OpenAI General Knowledge"],
-        index=0,
-        horizontal=True,
-        key="radio_data_mode",
-    )
+        # Common watermarks
+        'for reference only',
+        'confidential',
+        'draft',
+        'not for distribution',
+        'copyright',
+        '©',
+        'all rights reserved',
+        'proprietary',
+        'internal use only',
+        'do not copy',
+        'sample',
+        'preview',
+        'watermark',
+        
+        # Vaillant branding
+        'vaillant group',
+        'vaillant gmbh',
+        'installer',
+        'commissioning checklist',
+        'service record',
+        'best practice',
+        
+        # Document headers/footers
+        'page ',
+        'issue date',
+        'document number',
+        'version',
+        'revision',
+        'date:',
+        'ref:',
+    ]
     
-    # Show debug info toggle
-    show_debug = st.checkbox("🔍 Show retrieval debug info", value=False, key="show_debug")
+    # If text is SHORT and contains ANY watermark pattern, it's likely a watermark
+    if len(text.split()) < 20:
+        if any(pattern in text_lower for pattern in watermark_patterns):
+            return True
+    
+    # If >50% of text is watermark phrases, reject
+    watermark_count = sum(1 for pattern in watermark_patterns if pattern in text_lower)
+    words = text_lower.split()
+    
+    if len(words) > 0:
+        # Very aggressive: if 2+ watermark patterns found, likely watermark page
+        if watermark_count >= 2:
+            return True
+        
+        # If watermark words make up >20% of text, reject
+        if watermark_count > len(set(words)) * 0.2:
+            return True
+    
+    return False
 
-    # Session state initialization
+
+def is_relevant_diagram(base_img_data: Dict, min_width: int = 200, min_height: int = 200) -> bool:
+    """
+    Filter out QR codes, logos, and other non-technical diagrams.
+    Returns True if image should be KEPT.
+    """
+    width = base_img_data.get("width", 0)
+    height = base_img_data.get("height", 0)
+    
+    if width < min_width or height < min_height:
+        return False
+    
+    aspect_ratio = width / height if height > 0 else 0
+    if 0.95 < aspect_ratio < 1.05:
+        if width < 400:
+            return False
+    
+    if width > 3000 or height > 3000:
+        return False
+        
+    return True
+
+
+def has_sufficient_content(ocr_text: str, min_words: int = 5) -> bool:
+    """
+    Check if image contains meaningful technical content via OCR.
+    Returns True if content is relevant (should be KEPT).
+    STRICTER version to filter out more noise.
+    """
+    if not ocr_text or len(ocr_text.strip()) < 15:
+        return False
+    
+    # IMMEDIATE rejection checks
+    if detect_qr_code_patterns(ocr_text):
+        return False
+    
+    if detect_watermark_text(ocr_text):
+        return False
+    
+    if is_blank_page(ocr_text):
+        return False
+    
+    # Count words - STRICTER
+    words = ocr_text.split()
+    if len(words) < min_words:
+        return False
+    
+    # Check for technical keywords
+    technical_keywords = [
+        'cylinder', 'pump', 'valve', 'sensor', 'temperature', 
+        'pressure', 'flow', 'heating', 'water', 'installation',
+        'wiring', 'diagram', 'circuit', 'tank', 'coil', 'pipe',
+        'control', 'thermostat', 'outlet', 'inlet', 'connector',
+        'boiler', 'heat exchanger', 'expansion', 'safety',
+        'electrical', 'connection', 'terminal', 'switch',
+        'specification', 'dimension', 'mounting', 'bracket',
+        'gas', 'flue', 'combustion', 'burner', 'ignition',
+        'zone', 'radiator', 'pipework', 'fitting', 'joint',
+        'condensate', 'drain', 'vent', 'air', 'exhaust',
+        'manifold', 'header', 'mixer', 'actuator', 'relay',
+        'mm', 'cm', 'inch', 'bar', 'psi', 'kwh', 'kw'
+    ]
+    
+    text_lower = ocr_text.lower()
+    
+    technical_count = sum(1 for keyword in technical_keywords if keyword in text_lower)
+    
+    # Require MORE technical keywords
+    if technical_count >= 3:
+        return True
+    
+    # EXPANDED branding keywords to reject
+    branding_keywords = [
+        'benchmark', 'collective mark', 'quality', 'compliance',
+        'best practice', 'commissioning', 'servicing', 'maintenance',
+        'mark of quality', 'installer', 'competent person',
+        'building regulations', 'certificate', 'declaration',
+        'warranty', 'guarantee', 'registration',
+        'domestic heating', 'water solutions',
+        'vaillant group', 'gmbh'
+    ]
+    
+    branding_count = sum(1 for k in branding_keywords if k in text_lower)
+    
+    # If MOSTLY branding text, reject
+    if branding_count > technical_count:
+        return False
+    
+    # Require at least SOME technical content
+    return technical_count >= 1
+
+
+def clean_ocr_text(ocr_text: str) -> str:
+    """
+    Remove watermarks, headers, footers, and noise from OCR text.
+    Returns cleaned text.
+    """
+    if not ocr_text:
+        return ""
+    
+    lines = ocr_text.split('\n')
+    cleaned_lines = []
+    
+    watermark_patterns = [
+        'for reference only', 'confidential', 'draft',
+        'not for distribution', 'copyright', '©',
+        'all rights reserved', 'proprietary',
+        'vaillant group', 'benchmark', 'mark of quality',
+        'page ', 'issue date', 'document number',
+        'version', 'revision'
+    ]
+    
+    for line in lines:
+        line_lower = line.lower().strip()
+        
+        if not line_lower:
+            continue
+        
+        if any(pattern in line_lower for pattern in watermark_patterns):
+            continue
+        
+        if line.strip().replace('.', '').replace(',', '').isdigit():
+            continue
+        
+        if len(line.strip()) < 5:
+            continue
+        
+        cleaned_lines.append(line.strip())
+    
+    return '\n'.join(cleaned_lines)
+
+
+def extract_text_from_image(image_path: str) -> str:
+    """Extract text from image using OCR with cleaning."""
+    try:
+        import pytesseract
+        from PIL import Image
+        
+        img = Image.open(image_path)
+        text = pytesseract.image_to_string(img)
+        
+        cleaned_text = clean_ocr_text(text)
+        
+        return cleaned_text.strip()
+    except ImportError:
+        return "[OCR not available - install pytesseract]"
+    except Exception as e:
+        return f"[OCR error: {e}]"
+
+
+def highlight_relevant_text(ocr_text: str, query: str, max_snippets: int = 3) -> List[str]:
+    """Find text snippets from OCR that are relevant to the query."""
+    if not ocr_text or len(ocr_text) < 10:
+        return []
+    
+    lines = [line.strip() for line in ocr_text.split('\n') if line.strip()]
+    query_words = set(query.lower().split())
+    scored_lines = []
+    
+    for line in lines:
+        if detect_watermark_text(line):
+            continue
+        
+        line_words = set(line.lower().split())
+        overlap = len(query_words & line_words)
+        if overlap > 0:
+            scored_lines.append((overlap, line))
+    
+    scored_lines.sort(reverse=True, key=lambda x: x[0])
+    return [line for _, line in scored_lines[:max_snippets]]
+
+
+def resolve_images_for_item(item: Dict) -> List[str]:
+    """Resolve images for a manual page."""
+    images = []
+    base_dir = os.path.dirname(__file__)
+    
+    for rel_path in item.get("image_paths", []):
+        if os.path.isabs(rel_path):
+            abs_path = rel_path
+        else:
+            abs_path = os.path.join(base_dir, rel_path)
+        
+        if os.path.exists(abs_path):
+            images.append(abs_path)
+    
+    return images
+
+
+def filter_retrieved_items(items: List[Dict], query: str) -> List[Dict]:
+    """
+    Filter out low-relevance items from retrieval results.
+    AGGRESSIVE: Removes QR codes, logos, blank pages, watermarks, and branding images.
+    """
+    filtered = []
+    
+    for item in items:
+        # Stricter similarity threshold
+        if item.get("similarity", 0) < 0.30:
+            continue
+        
+        item_text = item.get("text", "")
+        
+        # Check if text content is blank/watermark
+        if is_blank_page(item_text) or detect_watermark_text(item_text):
+            continue
+        
+        # Filter images
+        images = resolve_images_for_item(item)
+        relevant_images = []
+        
+        for img_path in images:
+            try:
+                # Quick filename check - EXPANDED
+                filename_lower = os.path.basename(img_path).lower()
+                if any(keyword in filename_lower for keyword in [
+                    'benchmark', 'logo', 'qr', 'barcode', 'watermark',
+                    'mark', 'brand', 'footer', 'header'
+                ]):
+                    continue
+                
+                # Get image dimensions
+                try:
+                    from PIL import Image
+                    img = Image.open(img_path)
+                    width, height = img.size
+                    
+                    # STRICTER size filtering
+                    if width < 250 or height < 250:
+                        continue
+                    
+                    # STRICTER aspect ratio filtering for QR codes
+                    aspect_ratio = width / height
+                    
+                    # Nearly square images under 600px are likely QR codes/logos
+                    if 0.90 < aspect_ratio < 1.10:
+                        if width < 600:
+                            continue
+                    
+                    # Very wide or tall images might be headers/footers
+                    if aspect_ratio > 4.0 or aspect_ratio < 0.25:
+                        continue
+                        
+                except Exception:
+                    pass
+                
+                # OCR check if available
+                ocr_text = extract_text_from_image(img_path)
+                
+                if not ocr_text.startswith("["):
+                    # IMMEDIATE rejection for QR codes
+                    if detect_qr_code_patterns(ocr_text):
+                        continue
+                    
+                    # IMMEDIATE rejection for watermarks
+                    if detect_watermark_text(ocr_text):
+                        continue
+                    
+                    # STRICTER content requirements
+                    if has_sufficient_content(ocr_text, min_words=5):
+                        relevant_images.append(img_path)
+                else:
+                    # OCR not available - only keep if dimensions pass stricter tests
+                    if width >= 300 and height >= 300:
+                        aspect_ratio = width / height
+                        if not (0.90 < aspect_ratio < 1.10):
+                            relevant_images.append(img_path)
+                    
+            except Exception:
+                pass
+        
+        # Update item with filtered images
+        item["image_paths"] = relevant_images
+        
+        # Only keep items with text OR relevant images
+        if item.get("text") or relevant_images:
+            filtered.append(item)
+    
+    return filtered
+
+
+def save_feedback(question: str, response: str, helpful: bool, feedback_type: str = "text"):
+    """Save user feedback."""
+    try:
+        df = load_feedback_data()
+        
+        new_row = pd.DataFrame([{
+            "timestamp": datetime.now().isoformat(),
+            "question": question,
+            "response": response[:500],
+            "helpful": "👍 Yes" if helpful else "👎 No",
+            "type": feedback_type
+        }])
+        
+        if "type" not in df.columns:
+            df["type"] = "text"
+        
+        df = pd.concat([df, new_row], ignore_index=True)
+        df.to_csv(FEEDBACK_FILE, index=False)
+        
+        st.success(f"✅ Thank you for your feedback!")
+        
+    except Exception as e:
+        st.error(f"❌ Failed to save feedback: {e}")
+
+
+# ==============================================================
+# 🤖 CHATBOT UI
+# ==============================================================
+
+def render_chatbot():
+    """Render the complete chatbot interface with filtering."""
+    
+    st.markdown("---")
+    st.markdown("---")
+    st.subheader("💬 AI Simulation Assistant")
+    st.caption("Ask about cylinder specifications, installation, or simulation behavior")
+    
     if "chatbot_response" not in st.session_state:
         st.session_state.chatbot_response = None
     if "chatbot_query" not in st.session_state:
@@ -2737,183 +2728,118 @@ if __name__ == "__main__":
         st.session_state.current_response_id = None
     if "image_feedback" not in st.session_state:
         st.session_state.image_feedback = {}
-
-    # --------------------------------------------------------------
-    # Helper: Extract text from image using OCR
-    # --------------------------------------------------------------
-    def extract_text_from_image(image_path: str) -> str:
-        """Extract text from image using OCR."""
-        try:
-            import pytesseract
-            from PIL import Image
-            
-            img = Image.open(image_path)
-            text = pytesseract.image_to_string(img)
-            return text.strip()
-        except ImportError:
-            return "[OCR not available - install pytesseract]"
-        except Exception as e:
-            return f"[OCR error: {e}]"
-
-    # --------------------------------------------------------------
-    # Helper: Find relevant text snippets from OCR
-    # --------------------------------------------------------------
-    def highlight_relevant_text(ocr_text: str, query: str, max_snippets: int = 3) -> List[str]:
-        """Find text snippets from OCR that are relevant to the query."""
-        if not ocr_text or len(ocr_text) < 10:
-            return []
-        
-        lines = [line.strip() for line in ocr_text.split('\n') if line.strip()]
-        query_words = set(query.lower().split())
-        scored_lines = []
-        
-        for line in lines:
-            line_words = set(line.lower().split())
-            overlap = len(query_words & line_words)
-            if overlap > 0:
-                scored_lines.append((overlap, line))
-        
-        scored_lines.sort(reverse=True, key=lambda x: x[0])
-        return [line for _, line in scored_lines[:max_snippets]]
-
-    # --------------------------------------------------------------
-    # Helper: Resolve images for a manual page
-    # --------------------------------------------------------------
-    def resolve_images_for_item(item):
-        images = []
-        base_dir = os.path.dirname(__file__)
-
-        for rel_path in item.get("image_paths", []):
-            abs_path = os.path.join(base_dir, rel_path)
-            if os.path.exists(abs_path):
-                images.append(abs_path)
-
-        return images
-
-
-    # --------------------------------------------------------------
-    # Helper: Score responses using ML model
-    # --------------------------------------------------------------
-    def score_responses(query: str, responses: List[str]) -> List[float]:
-        """Score responses using trained ML model."""
-        try:
-            if not os.path.exists(MODEL_FILE) or not os.path.exists(VEC_FILE):
-                return [0.5] * len(responses)
-            
-            vec = joblib.load(VEC_FILE)
-            model = joblib.load(MODEL_FILE)
-            
-            scores = []
-            for resp in responses:
-                X = vec.transform([f"{query} {resp}"])
-                prob = model.predict_proba(X)[0]
-                scores.append(prob[1] if len(prob) > 1 else 0.5)
-            
-            return scores
-        except Exception as e:
-            st.warning(f"⚠️ ML scoring failed: {e}")
-            return [0.5] * len(responses)
-
-    # --------------------------------------------------------------
-    # Helper: Save feedback
-    # --------------------------------------------------------------
-    def save_feedback(question: str, response: str, helpful: bool, feedback_type: str = "text"):
-        """Save user feedback and trigger retraining if threshold met."""
-        try:
-            df = load_feedback_data()
-            
-            new_row = pd.DataFrame([{
-                "timestamp": datetime.now().isoformat(),
-                "question": question,
-                "response": response[:500],
-                "helpful": "👍 Yes" if helpful else "👎 No",
-                "type": feedback_type
-            }])
-            
-            if "type" not in df.columns:
-                df["type"] = "text"
-            
-            df = pd.concat([df, new_row], ignore_index=True)
-            df.to_csv(FEEDBACK_FILE, index=False)
-            
-            if len(df) >= RETRAIN_THRESHOLD and len(df) % RETRAIN_THRESHOLD == 0:
-                with st.spinner("🔄 Retraining ML model..."):
-                    train_feedback_model(df)
-                st.success("✅ Model retrained with new feedback!")
-            
-            st.success(f"✅ Thank you for your {'image' if feedback_type == 'image' else 'text'} feedback!")
-            
-        except Exception as e:
-            st.error(f"❌ Failed to save feedback: {e}")
-
-    # --------------------------------------------------------------
-    # Run chatbot when Ask button clicked
-    # --------------------------------------------------------------
+    
+    col1, col2 = st.columns([5, 1])
+    with col1:
+        query = st.text_input(
+            "Question",
+            key="user_question",
+            placeholder="e.g., What is the cylinder volume? How does legionella protection work?",
+            label_visibility="collapsed",
+        )
+    with col2:
+        st.write("")
+        st.write("")
+        ask_button = st.button("🔍 Ask", key="btn_ask", use_container_width=True)
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("### 🧭 Data Source")
+        data_mode = st.radio(
+            "Choose response mode:",
+            ["Manual Data (RAG from Vaillant PDF)", "OpenAI General Knowledge"],
+            index=0,
+            key="radio_data_mode",
+        )
+    
+    with col2:
+        st.markdown("### 🔧 Debug Options")
+        show_debug = st.checkbox("Show retrieval details", value=False, key="show_debug")
+        show_filtering_stats = st.checkbox("Show filtering statistics", value=False, key="show_filter_stats")
+    
     if ask_button and query:
         
-        # Clear old results
         st.session_state.retrieved_items = []
         st.session_state.image_feedback = {}
         
         api_key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")
         if not api_key:
             st.warning("⚠️ Please set your OpenAI API key.")
-        else:
-            with st.spinner("🤔 Generating responses..."):
-
-                client_chat = OpenAI(api_key=api_key)
-                responses = []
-                retrieved_items = []
-
-                # Generate multiple candidate responses
-                for i in range(3):
-                    kb_context = ""
-
-                    # MANUAL MODE - with improved retrieval
-                    if data_mode.startswith("Manual"):
-                        # Retrieve MORE results initially
-                        top_items = retrieve_faiss_context(query, top_k=8, show_debug=show_debug)
-
-                        if not top_items:
-                            st.warning("No relevant manual content found. Trying with general knowledge...")
-                            break
-
-                        # Only store retrieved items once
-                        if i == 0:
-                            retrieved_items = top_items
-
-                        kb_context = "\n\n".join(
-                            f"[Manual Page {it.get('page','?')}, Similarity {it.get('similarity',0):.3f}]\n{it.get('text','')}"
-                            for it in top_items
+            return
+        
+        with st.spinner("🤔 Thinking..."):
+            
+            client_chat = OpenAI(api_key=api_key)
+            
+            kb_context = ""
+            retrieved_items = []
+            filtering_stats = {}
+            
+            if data_mode.startswith("Manual"):
+                
+                if show_filtering_stats:
+                    index, meta = load_faiss_index(st.session_state.kb_version)
+                    if index and meta:
+                        emb_resp = client_chat.embeddings.create(
+                            model="text-embedding-3-large",
+                            input=query,
                         )
-
-                    # AUTO MODE
-                    else:
-                        kb_context = "Use general HVAC and heat pump knowledge."
-
-                    # Build additional context
-                    layer_properties = st.session_state.get("layer_properties", {})
-                    geometry_context = "\n".join(
-                        f"{n}: Volume={p['Volume_L']:.1f} L"
-                        for n, p in layer_properties.items()
-                    )
-
-                    summary = st.session_state.get("summary", {})
-                    summary_text = "\n".join(f"{k}: {v}" for k, v in summary.items())
-
-                    # Prompt
-                    if data_mode.startswith("Manual"):
-                        system_msg = (
-                            "You are a technical assistant. "
-                            "You MUST answer ONLY using the provided Manual Context. "
-                            "If the answer is not explicitly contained in the manual, say: "
-                            "'This information is not available in the manual.' "
-                            "Do NOT use general HVAC knowledge."
-                        )
-                    else:
-                        system_msg = "You are an HVAC expert assistant."
-
-                    prompt = f"""
+                        emb_vec = np.array(emb_resp.data[0].embedding, dtype="float32").reshape(1, -1)
+                        faiss.normalize_L2(emb_vec)
+                        scores, ids = index.search(emb_vec, 12)
+                        
+                        unfiltered = []
+                        for score, idx in zip(scores[0], ids[0]):
+                            if 0 <= idx < len(meta):
+                                item = dict(meta[idx])
+                                item["similarity"] = float(score)
+                                unfiltered.append(item)
+                        
+                        filtering_stats["unfiltered_count"] = len(unfiltered)
+                        filtering_stats["unfiltered_images"] = sum(len(resolve_images_for_item(it)) for it in unfiltered)
+                
+                top_items = retrieve_faiss_context(query, top_k=5, show_debug=show_debug)
+                
+                if show_filtering_stats:
+                    filtering_stats["filtered_count"] = len(top_items)
+                    filtering_stats["filtered_images"] = sum(len(it.get("image_paths", [])) for it in top_items)
+                
+                if not top_items:
+                    st.warning("No relevant manual content found. Try rephrasing your question.")
+                    return
+                
+                retrieved_items = top_items
+                
+                kb_context = "\n\n".join(
+                    f"[Manual Page {it.get('page','?')}, Similarity {it.get('similarity',0):.3f}]\n{it.get('text','')}"
+                    for it in top_items
+                )
+            
+            else:
+                kb_context = "Use general HVAC and heat pump knowledge."
+            
+            layer_properties = st.session_state.get("layer_properties", {})
+            geometry_context = "\n".join(
+                f"{n}: Volume={p['Volume_L']:.1f} L"
+                for n, p in layer_properties.items()
+            )
+            
+            summary = st.session_state.get("summary", {})
+            summary_text = "\n".join(f"{k}: {v}" for k, v in summary.items())
+            
+            if data_mode.startswith("Manual"):
+                system_msg = (
+                    "You are a technical assistant for Vaillant heating systems. "
+                    "Answer ONLY using the provided Manual Context. "
+                    "If the answer is not in the manual, say: "
+                    "'This information is not available in the manual.' "
+                    "Be concise and technical."
+                )
+            else:
+                system_msg = "You are an HVAC expert assistant."
+            
+            prompt = f"""
 ## Manual Context
 {kb_context}
 
@@ -2925,56 +2851,40 @@ if __name__ == "__main__":
 
 ## Question
 {query}
+
+Provide a clear, technical answer based on the context above.
 """
-
-                    try:
-                        r = client_chat.chat.completions.create(
-                            model="gpt-4o-mini",
-                            messages=[
-                                {"role": "system", "content": system_msg},
-                                {"role": "user", "content": prompt},
-                            ],
-                            temperature=0.7 + (i * 0.1)
-                        )
-                        responses.append(r.choices[0].message.content.strip())
-
-                    except Exception as e:
-                        st.error(f"OpenAI error: {e}")
-                        break
-
-                # Score and select best response
-                if responses:
-                    scores = score_responses(query, responses)
-                    best_idx = scores.index(max(scores))
-                    best_response = responses[best_idx]
-                    
-                    if len(responses) > 1:
-                        st.info(f"🎯 Generated {len(responses)} responses. Selected best (score: {scores[best_idx]:.2f})")
-
-                    st.session_state.chatbot_response = best_response
-                    st.session_state.chatbot_query = query
-                    st.session_state.current_response_id = datetime.now().isoformat()
-
-                    # Deduplicate retrieved pages
-                    unique_pages = {}
-                    for item in retrieved_items:
-                        page = item.get("page")
-                        if page not in unique_pages:
-                            unique_pages[page] = item
-
-                    st.session_state.retrieved_items = list(unique_pages.values())
-
-    # ==============================================================
-    # Display chatbot response
-    # ==============================================================
+            
+            try:
+                response = client_chat.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": system_msg},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.3
+                )
+                
+                answer = response.choices[0].message.content.strip()
+                
+                st.session_state.chatbot_response = answer
+                st.session_state.chatbot_query = query
+                st.session_state.current_response_id = datetime.now().isoformat()
+                st.session_state.retrieved_items = retrieved_items
+                st.session_state.filtering_stats = filtering_stats
+                
+            except Exception as e:
+                st.error(f"❌ OpenAI error: {e}")
+                return
+    
     if st.session_state.chatbot_response and st.session_state.chatbot_query:
-
-        st.markdown("### 💬 Chatbot Response")
-        st.markdown(st.session_state.chatbot_response)
-
-        # Text Response Feedback
+        
         st.markdown("---")
-        st.markdown("**Was this text response helpful?**")
+        st.markdown("### 💬 Answer")
+        st.markdown(st.session_state.chatbot_response)
+        
+        st.markdown("---")
+        st.markdown("**Was this answer helpful?**")
         
         col1, col2, col3 = st.columns([1, 1, 8])
         
@@ -2995,89 +2905,102 @@ if __name__ == "__main__":
                     helpful=False,
                     feedback_type="text"
                 )
-
-        # Display Manual Images with OCR Text Only (NO AI Description)
+        
+        if show_filtering_stats and "filtering_stats" in st.session_state:
+            stats = st.session_state.filtering_stats
+            if stats:
+                st.markdown("---")
+                st.markdown("### 📊 Filtering Statistics")
+                col1, col2, col3, col4 = st.columns(4)
+                
+                with col1:
+                    st.metric("Initial Results", stats.get("unfiltered_count", "N/A"))
+                with col2:
+                    st.metric("After Filtering", stats.get("filtered_count", "N/A"))
+                with col3:
+                    st.metric("Images Before", stats.get("unfiltered_images", "N/A"))
+                with col4:
+                    st.metric("Images After", stats.get("filtered_images", "N/A"))
+        
         if data_mode.startswith("Manual") and st.session_state.retrieved_items:
-
+            
             st.markdown("---")
-            st.markdown("### 📷 Related Diagrams from Manual")
-
+            st.markdown("### 📷 Related Technical Diagrams")
+            
+            total_images_shown = 0
+            
             for item_idx, item in enumerate(st.session_state.retrieved_items):
                 page_num = item.get("page", "?")
-
-                st.markdown(f"#### 📄 Manual Page {page_num}")
-
-                images = resolve_images_for_item(item)
-
+                
+                images = item.get("image_paths", [])
+                
                 if not images:
-                    st.info("No diagrams found for this page.")
-                else:
-                    for img_idx, img in enumerate(images):
-                        
-                        # Display image
-                        st.image(
-                            img,
-                            caption=f"Manual Page {page_num} - Diagram {img_idx + 1}",
-                            use_container_width=True
+                    continue
+                
+                st.markdown(f"#### 📄 Manual Page {page_num}")
+                
+                for img_idx, img in enumerate(images):
+                    
+                    total_images_shown += 1
+                    
+                    st.image(
+                        img,
+                        caption=f"Page {page_num} - Diagram {img_idx + 1}",
+                        use_container_width=True
+                    )
+                    
+                    ocr_text = extract_text_from_image(img)
+                    
+                    if ocr_text and not ocr_text.startswith("["):
+                        relevant_snippets = highlight_relevant_text(
+                            ocr_text,
+                            st.session_state.chatbot_query
                         )
                         
-                        # OCR Text Extraction ONLY (No AI Description)
-                        ocr_text = extract_text_from_image(img)
+                        if relevant_snippets:
+                            with st.expander("📝 Key Text from Diagram", expanded=False):
+                                for snippet in relevant_snippets:
+                                    st.markdown(f"• `{snippet}`")
                         
-                        if ocr_text and not ocr_text.startswith("["):
-                            relevant_snippets = highlight_relevant_text(
-                                ocr_text, 
-                                st.session_state.chatbot_query
+                        with st.expander("📄 Full OCR Text", expanded=False):
+                            st.text(ocr_text)
+                    
+                    img_key = f"img_{item_idx}_{img_idx}_{st.session_state.current_response_id}"
+                    
+                    st.markdown("**Was this diagram helpful?**")
+                    col1, col2, col3 = st.columns([1, 1, 8])
+                    
+                    with col1:
+                        if st.button("👍 Yes", key=f"img_yes_{img_key}"):
+                            save_feedback(
+                                st.session_state.chatbot_query,
+                                f"Image from page {page_num}: {os.path.basename(img)}",
+                                helpful=True,
+                                feedback_type="image"
                             )
-                            
-                            if relevant_snippets:
-                                with st.expander("📝 Relevant Text from Diagram", expanded=True):
-                                    st.markdown("**Key text found in this diagram:**")
-                                    for snippet in relevant_snippets:
-                                        st.markdown(f"• `{snippet}`")
-                            
-                            # Full OCR text (collapsed by default)
-                            with st.expander("📄 Full Text from Image (OCR)", expanded=False):
-                                st.text(ocr_text)
-                        
-                        # Image Feedback
-                        img_key = f"img_{item_idx}_{img_idx}_{st.session_state.current_response_id}"
-                        
-                        st.markdown("---")
-                        st.markdown("**Was this diagram helpful for your question?**")
-                        col1, col2, col3 = st.columns([1, 1, 8])
-                        
-                        with col1:
-                            if st.button("👍 Yes", key=f"img_yes_{img_key}"):
-                                save_feedback(
-                                    st.session_state.chatbot_query,
-                                    f"Image from page {page_num}: {os.path.basename(img)}",
-                                    helpful=True,
-                                    feedback_type="image"
-                                )
-                                st.session_state.image_feedback[img_key] = "helpful"
-                        
-                        with col2:
-                            if st.button("👎 No", key=f"img_no_{img_key}"):
-                                save_feedback(
-                                    st.session_state.chatbot_query,
-                                    f"Image from page {page_num}: {os.path.basename(img)}",
-                                    helpful=False,
-                                    feedback_type="image"
-                                )
-                                st.session_state.image_feedback[img_key] = "not_helpful"
-                        
-                        if img_key in st.session_state.image_feedback:
-                            if st.session_state.image_feedback[img_key] == "helpful":
-                                st.success("✅ You marked this diagram as helpful")
-                            else:
-                                st.info("ℹ️ You marked this diagram as not helpful")
-                        
-                        st.markdown("---")
-
-                st.markdown("---")
-
-    # Feedback Statistics
+                            st.session_state.image_feedback[img_key] = "helpful"
+                    
+                    with col2:
+                        if st.button("👎 No", key=f"img_no_{img_key}"):
+                            save_feedback(
+                                st.session_state.chatbot_query,
+                                f"Image from page {page_num}: {os.path.basename(img)}",
+                                helpful=False,
+                                feedback_type="image"
+                            )
+                            st.session_state.image_feedback[img_key] = "not_helpful"
+                    
+                    if img_key in st.session_state.image_feedback:
+                        if st.session_state.image_feedback[img_key] == "helpful":
+                            st.success("✅ Marked as helpful")
+                        else:
+                            st.info("ℹ️ Marked as not helpful")
+                    
+                    st.markdown("---")
+            
+            if total_images_shown == 0:
+                st.info("No technical diagrams found for this query (QR codes, watermarks, and blank pages were filtered out).")
+    
     with st.expander("📊 Feedback Statistics", expanded=False):
         df_feedback = load_feedback_data()
         
@@ -3102,36 +3025,16 @@ if __name__ == "__main__":
             with col4:
                 st.metric("Image Feedback", len(image_feedback))
             
-            st.markdown("**Feedback Breakdown:**")
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.markdown("**Text Responses:**")
-                if len(text_feedback) > 0:
-                    text_helpful = (text_feedback["helpful"] == "👍 Yes").sum()
-                    st.write(f"Total: {len(text_feedback)} | Helpful: {text_helpful} ({text_helpful/len(text_feedback)*100:.1f}%)")
-                else:
-                    st.write("No text feedback yet")
-            
-            with col2:
-                st.markdown("**Diagrams/Images:**")
-                if len(image_feedback) > 0:
-                    img_helpful = (image_feedback["helpful"] == "👍 Yes").sum()
-                    st.write(f"Total: {len(image_feedback)} | Helpful: {img_helpful} ({img_helpful/len(image_feedback)*100:.1f}%)")
-                else:
-                    st.write("No image feedback yet")
-            
             st.markdown("**Recent Feedback:**")
             display_df = df_feedback[["timestamp", "question", "helpful", "type"]].tail(10)
             st.dataframe(display_df, use_container_width=True, hide_index=True)
-            
-            if len(df_feedback) >= 5:
-                if st.button("🔄 Retrain Model Now", key="btn_retrain_manual"):
-                    with st.spinner("Training..."):
-                        vec, model = train_feedback_model(df_feedback)
-                        if vec and model:
-                            st.success("✅ Model retrained successfully!")
-                        else:
-                            st.warning("⚠️ Need at least 5 feedback samples to train")
         else:
-            st.info("No feedback collected yet. Rate some responses to start training!")
+            st.info("No feedback collected yet. Rate some responses to start tracking!")
+
+
+# ==============================================================
+# 🔄 ENTRY POINT
+# ==============================================================
+if __name__ == "__main__":
+    main()
+    render_chatbot()
