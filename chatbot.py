@@ -461,13 +461,13 @@ def save_image_feedback(chunk_id: str, img_index: int, helpful: bool):
 # Chat UI
 # =========================
 def chat_ui():
-    st.title("💬 AI Simulation Assistant")
+    st.title("💬 The Vaillant Brain")
 
     if not st.session_state.kb_ready:
         st.info("Upload a PDF and rebuild the knowledge base to begin.")
         return
 
-    q = st.text_input("Ask a question")
+    q = st.text_input("Ask The Vaillant Brain a question")
     if st.button("Ask") and q:
         ctx = retrieve(q)
         st.session_state.retrieved_items = ctx
