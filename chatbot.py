@@ -52,7 +52,10 @@ os.makedirs(LOG_DIR, exist_ok=True)
 # 🔑 OpenAI key (hidden)
 # =========================
 def get_openai_key() -> Optional[str]:
-    return os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")
+    try:
+        return os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")
+    except Exception:
+        return os.getenv("OPENAI_API_KEY")
 
 def require_openai_key() -> bool:
     if not get_openai_key():
@@ -72,15 +75,34 @@ def get_client() -> OpenAI:
 def init_state():
     defaults = {
         "manual_pdf_path": None,
+        "manual_pdf_name": None,
+        "manual_pdf_b64": None,
+
         "kb_ready": False,
+
+        "question_text": "",
+        "question_id": None,
+
         "retrieved_items": [],
         "answer": None,
-        "image_feedback_given": set(),  # {(chunk_id, img_idx)}
+
+        # per-question: prevent “same images from last question”
+        "question_diagram_cache": {},  # qid -> list[diagram dict]
+
+        # vote UX (don’t re-ask once voted)
+        "image_feedback_given": set(),  # {(chunk_id, img_index)}
+
+        # rebuild toast
         "kb_rebuild_complete": False,
         "kb_last_stats": None,
-        # feedback cache
-        "img_feedback_cache": None,  # dict
-        "img_feedback_cache_mtime": None,
+
+        # UI controls
+        "hide_bad_images": True,
+        "hide_bad_images_threshold": 0.25,
+        "hide_bad_min_votes": 3,
+        "force_diversity_pages": True,
+        "max_images_to_show": 12,
+        "show_why_overlay": True,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -101,8 +123,40 @@ def stable_hash(text: str) -> str:
 def safe_filename(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]+", "_", name)
 
+def compute_question_id(q: str) -> str:
+    qn = re.sub(r"\s+", " ", (q or "").strip().lower())
+    return stable_hash(qn or str(time.time()))
+
+def clear_view():
+    # clear answer + diagrams for “current view”
+    st.session_state.answer = None
+    st.session_state.retrieved_items = []
+    # keep feedback_given set (so we don’t re-ask for already voted images in same session)
+    # remove per-image widget states for radios
+    for k in list(st.session_state.keys()):
+        if k.startswith("imgfb_"):
+            del st.session_state[k]
+
+def on_question_edit():
+    # Auto-clear diagrams when user edits question text
+    clear_view()
+
 # =========================
-# Image helpers
+# PDF deep-linking
+# =========================
+def pdf_page_link(page: int) -> Optional[str]:
+    b64 = st.session_state.get("manual_pdf_b64")
+    if not b64:
+        path = st.session_state.get("manual_pdf_path")
+        if not path or not os.path.exists(path):
+            return None
+        with open(path, "rb") as f:
+            b64 = bytes_to_b64(f.read())
+        st.session_state.manual_pdf_b64 = b64
+    return f"data:application/pdf;base64,{b64}#page={page}"
+
+# =========================
+# Image extraction
 # =========================
 def looks_like_blank(img_bytes: bytes) -> bool:
     return not img_bytes or len(img_bytes) < 8000
@@ -121,11 +175,10 @@ def extract_page_images(pdf_path: str, page_num: int) -> List[Dict[str, Any]]:
             try:
                 base = doc.extract_image(img[0])
                 b = base.get("image")
-                if not b or looks_like_blank(b):
-                    continue
-                out.append({"b64": bytes_to_b64(b), "kind": "embedded", "page": page_num})
+                if b and not looks_like_blank(b):
+                    out.append({"b64": bytes_to_b64(b), "page": page_num, "kind": "embedded"})
             except Exception:
-                continue
+                pass
 
         # render fallback
         if not out:
@@ -133,7 +186,7 @@ def extract_page_images(pdf_path: str, page_num: int) -> List[Dict[str, Any]]:
                 pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
                 b = pix.tobytes("png")
                 if not looks_like_blank(b):
-                    out.append({"b64": bytes_to_b64(b), "kind": "render", "page": page_num})
+                    out.append({"b64": bytes_to_b64(b), "page": page_num, "kind": "render"})
             except Exception:
                 pass
 
@@ -147,15 +200,13 @@ def extract_page_images(pdf_path: str, page_num: int) -> List[Dict[str, Any]]:
 # Embeddings
 # =========================
 def embed_texts(client: OpenAI, texts: List[str]) -> np.ndarray:
-    vecs: List[np.ndarray] = []
+    vecs = []
     for i in range(0, len(texts), 64):
-        batch = texts[i:i + 64]
-        r = client.embeddings.create(model="text-embedding-3-large", input=batch)
-        data = list(r.data)
-        # keep order if index exists
-        if data and hasattr(data[0], "index"):
-            data.sort(key=lambda d: d.index)  # type: ignore
-        for d in data:
+        r = client.embeddings.create(
+            model="text-embedding-3-large",
+            input=texts[i:i + 64],
+        )
+        for d in r.data:
             vecs.append(np.array(d.embedding, dtype="float32"))
     return np.vstack(vecs) if vecs else np.zeros((0, 0), dtype="float32")
 
@@ -175,12 +226,12 @@ def load_faiss():
         return None, None
 
 # =========================
-# Feedback aggregation (images)
+# Feedback aggregation (global + per-question)
 # =========================
-def _read_feedback_file() -> List[Dict[str, Any]]:
+def _read_feedback_rows() -> List[Dict[str, Any]]:
     if not os.path.exists(IMAGE_FEEDBACK_FILE):
         return []
-    rows: List[Dict[str, Any]] = []
+    rows = []
     with open(IMAGE_FEEDBACK_FILE, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -189,95 +240,93 @@ def _read_feedback_file() -> List[Dict[str, Any]]:
             try:
                 rows.append(json.loads(line))
             except Exception:
-                continue
+                pass
     return rows
 
-def get_image_feedback_stats(force: bool = False) -> Dict[Tuple[str, int], Dict[str, Any]]:
+def get_image_feedback_stats() -> Tuple[
+    Dict[Tuple[str, int], Dict[str, Any]],
+    Dict[Tuple[str, int, str], Dict[str, Any]]
+]:
     """
-    Returns stats keyed by (chunk_id, image_index):
-      {
-        (cid, idx): {
-            "pos": int,
-            "neg": int,
-            "n": int,
-            "score": float,   # smoothed helpfulness in [0,1]
-        }
-      }
-    Uses a simple Bayesian smoothing prior so early votes don't swing too hard:
-      score = (pos + 1) / (pos + neg + 2)
+    Returns:
+      global_stats[(chunk_id, img_idx)] = {pos, neg, votes, score}
+      per_q_stats[(chunk_id, img_idx, qid)] = {pos, neg, votes, score}
+    Score uses Laplace smoothing: (pos+1)/(votes+2)
     """
-    try:
-        mtime = os.path.getmtime(IMAGE_FEEDBACK_FILE) if os.path.exists(IMAGE_FEEDBACK_FILE) else None
-    except Exception:
-        mtime = None
+    global_stats: Dict[Tuple[str, int], Dict[str, Any]] = {}
+    per_q_stats: Dict[Tuple[str, int, str], Dict[str, Any]] = {}
 
-    if (not force) and st.session_state.get("img_feedback_cache") is not None:
-        if st.session_state.get("img_feedback_cache_mtime") == mtime:
-            return st.session_state.img_feedback_cache  # type: ignore
+    for r in _read_feedback_rows():
+        cid = str(r.get("chunk_id", ""))
+        idx = r.get("image_index", None)
+        helpful = r.get("helpful", None)
+        qid = str(r.get("question_id", ""))
 
-    stats: Dict[Tuple[str, int], Dict[str, Any]] = {}
-    for row in _read_feedback_file():
-        cid = row.get("chunk_id")
-        idx = row.get("image_index")
-        helpful = row.get("helpful")
-        if not cid or idx is None:
+        if not cid or idx is None or helpful is None:
             continue
-        key = (str(cid), int(idx))
-        if key not in stats:
-            stats[key] = {"pos": 0, "neg": 0, "n": 0, "score": 0.5}
-        if helpful is True:
-            stats[key]["pos"] += 1
-        elif helpful is False:
-            stats[key]["neg"] += 1
-        stats[key]["n"] += 1
 
-    # smoothed score
-    for key, d in stats.items():
-        pos, neg = d["pos"], d["neg"]
-        d["score"] = (pos + 1) / (pos + neg + 2)  # Laplace smoothing
+        idx = int(idx)
 
-    st.session_state.img_feedback_cache = stats
-    st.session_state.img_feedback_cache_mtime = mtime
-    return stats
+        gkey = (cid, idx)
+        global_stats.setdefault(gkey, {"pos": 0, "neg": 0})
+        if helpful:
+            global_stats[gkey]["pos"] += 1
+        else:
+            global_stats[gkey]["neg"] += 1
 
-def image_penalty_factor(score_0_1: float, n_votes: int) -> float:
-    """
-    Convert image helpfulness score into a multiplicative factor for retrieval ranking.
-    - score near 1 => boost slightly
-    - score near 0 => penalize
-    Make effect mild when vote count is low.
-    """
-    # vote confidence scale in [0.0..1.0], ramps up by ~8 votes
-    conf = min(1.0, n_votes / 8.0)
-    # map score into [-1..+1]
-    centered = (score_0_1 - 0.5) * 2.0
-    # max +/- 25% effect at high confidence
-    return 1.0 + (0.25 * centered * conf)
+        if qid:
+            qkey = (cid, idx, qid)
+            per_q_stats.setdefault(qkey, {"pos": 0, "neg": 0})
+            if helpful:
+                per_q_stats[qkey]["pos"] += 1
+            else:
+                per_q_stats[qkey]["neg"] += 1
 
-def chunk_image_quality(chunk_id: str, num_images: int, stats: Dict[Tuple[str, int], Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Summarize image feedback for a chunk:
-      avg_score, n_votes_total, penalty_factor
-    If no votes, neutral.
-    """
-    if num_images <= 0:
-        return {"avg_score": 0.5, "n_votes": 0, "factor": 1.0}
+    def finalize(d: Dict[str, Any]) -> Dict[str, Any]:
+        pos = int(d.get("pos", 0))
+        neg = int(d.get("neg", 0))
+        votes = pos + neg
+        score = (pos + 1) / (votes + 2)
+        d["votes"] = votes
+        d["score"] = float(score)
+        return d
 
-    scores = []
-    n_total = 0
-    for idx in range(num_images):
-        d = stats.get((chunk_id, idx))
-        if not d:
-            continue
-        scores.append(float(d.get("score", 0.5)))
-        n_total += int(d.get("n", 0))
+    for k in list(global_stats.keys()):
+        global_stats[k] = finalize(global_stats[k])
 
-    if not scores:
-        return {"avg_score": 0.5, "n_votes": 0, "factor": 1.0}
+    for k in list(per_q_stats.keys()):
+        per_q_stats[k] = finalize(per_q_stats[k])
 
-    avg = float(np.mean(scores))
-    factor = image_penalty_factor(avg, n_total)
-    return {"avg_score": avg, "n_votes": n_total, "factor": factor}
+    return global_stats, per_q_stats
+
+def confidence_weight(votes: int) -> float:
+    # ramp confidence by ~8 votes
+    return min(1.0, votes / 8.0)
+
+def combined_helpfulness(
+    global_score: float, global_votes: int,
+    perq_score: float, perq_votes: int
+) -> float:
+    # Blend per-question score (if present) + global score
+    wq = confidence_weight(perq_votes)
+    wg = confidence_weight(global_votes)
+    if wq + wg == 0:
+        return 0.5
+    return (perq_score * wq + global_score * wg) / (wq + wg)
+
+# =========================
+# Image feedback persistence
+# =========================
+def save_image_feedback(chunk_id: str, img_index: int, helpful: bool, question_id: Optional[str]):
+    entry = {
+        "ts": time.time(),
+        "chunk_id": chunk_id,
+        "image_index": int(img_index),
+        "helpful": bool(helpful),
+        "question_id": question_id,
+    }
+    with open(IMAGE_FEEDBACK_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
 
 # =========================
 # KB rebuild
@@ -290,33 +339,24 @@ def rebuild_kb():
     if not pdf:
         st.error("Upload a PDF first.")
         return
-
     if faiss is None:
-        st.error("faiss-cpu not installed")
+        st.error("faiss-cpu not installed.")
         return
 
     client = get_client()
-
-    try:
-        reader = PdfReader(pdf)
-    except Exception as e:
-        st.error(f"Could not open PDF: {e}")
-        return
+    reader = PdfReader(pdf)
 
     items: List[Dict[str, Any]] = []
     img_pages = 0
     img_total = 0
+
     prog = st.progress(0)
     status = st.empty()
-    n_pages = len(reader.pages)
 
+    n_pages = len(reader.pages)
     for i, page in enumerate(reader.pages, start=1):
         status.write(f"Processing page {i}/{n_pages} ...")
-        try:
-            text = (page.extract_text() or "").strip()
-        except Exception:
-            text = ""
-
+        text = (page.extract_text() or "").strip()
         if len(text) < 120:
             prog.progress(int(i / n_pages * 70))
             continue
@@ -368,12 +408,9 @@ def rebuild_kb():
         "img_pages": img_pages,
         "img_total": img_total,
     }
-    # refresh feedback cache (not strictly required)
-    st.session_state.img_feedback_cache = None
-    st.session_state.img_feedback_cache_mtime = None
 
 # =========================
-# Retrieval (down-rank bad diagrams)
+# Retrieval
 # =========================
 def retrieve(query: str, k: int = 6):
     if not require_openai_key():
@@ -388,29 +425,15 @@ def retrieve(query: str, k: int = 6):
     qv = np.array(r.data[0].embedding, dtype="float32").reshape(1, -1)
     faiss.normalize_L2(qv)
 
-    scores, ids = index.search(qv, max(k * 4, 12))  # overfetch so rerank has room
-    raw: List[Dict[str, Any]] = []
+    scores, ids = index.search(qv, k)
+    out = []
     for s, idx in zip(scores[0], ids[0]):
         if idx < 0 or idx >= len(meta):
             continue
         it = dict(meta[idx])
         it["similarity"] = float(s)
-        raw.append(it)
-
-    # Apply image-quality rerank
-    stats = get_image_feedback_stats()
-    for it in raw:
-        cid = str(it.get("chunk_id", ""))
-        imgs = it.get("images") or []
-        qsum = chunk_image_quality(cid, len(imgs), stats)
-        it["img_avg_score"] = qsum["avg_score"]
-        it["img_votes"] = qsum["n_votes"]
-        it["img_factor"] = qsum["factor"]
-        # final score = similarity * image factor
-        it["final_score"] = float(it.get("similarity", 0.0)) * float(it["img_factor"])
-
-    raw.sort(key=lambda x: float(x.get("final_score", x.get("similarity", 0.0))), reverse=True)
-    return raw[:k]
+        out.append(it)
+    return out
 
 # =========================
 # Sidebar
@@ -424,7 +447,11 @@ def sidebar_ui():
         with open(path, "wb") as f:
             f.write(pdf.read())
         st.session_state.manual_pdf_path = path
+        st.session_state.manual_pdf_name = pdf.name
+        st.session_state.manual_pdf_b64 = None
         st.success(f"Loaded {pdf.name}")
+        # new doc => clear view
+        clear_view()
 
     if st.button("🔁 Rebuild Knowledge Base"):
         rebuild_kb()
@@ -441,21 +468,58 @@ def sidebar_ui():
         st.session_state.kb_rebuild_complete = False
 
     st.markdown("---")
-    st.subheader("🖼️ Diagram quality controls")
-    st.checkbox("Hide diagrams that are strongly down-voted", value=True, key="hide_bad_images")
-    st.slider("Hide threshold (helpfulness score)", 0.0, 1.0, 0.25, 0.05, key="hide_bad_images_threshold")
-    st.caption("Helpfulness is learned from your 👍/👎 votes (smoothed).")
+    st.subheader("🖼️ Diagram ranking controls")
+    st.checkbox("Auto-hide low-score diagrams", key="hide_bad_images")
+    st.slider("Hide threshold", 0.0, 1.0, 0.25, 0.05, key="hide_bad_images_threshold")
+    st.slider("Min votes before hiding", 1, 10, 3, 1, key="hide_bad_min_votes")
+    st.checkbox("Force diversity (no duplicate pages)", key="force_diversity_pages")
+    st.checkbox("Explain why each image was shown", key="show_why_overlay")
+    st.slider("Max images to show", 1, 50, 12, 1, key="max_images_to_show")
 
 # =========================
-# Image feedback persistence
+# Build diagrams list for current question (sorted by usefulness)
 # =========================
-def save_image_feedback(chunk_id: str, img_index: int, helpful: bool):
-    entry = {"ts": time.time(), "chunk_id": chunk_id, "image_index": img_index, "helpful": helpful}
-    with open(IMAGE_FEEDBACK_FILE, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry) + "\n")
-    # bust cache so new votes affect ranking immediately
-    st.session_state.img_feedback_cache = None
-    st.session_state.img_feedback_cache_mtime = None
+def build_diagrams_for_question(qid: str, retrieved_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    global_stats, perq_stats = get_image_feedback_stats()
+
+    diagrams: List[Dict[str, Any]] = []
+    for it in retrieved_items:
+        cid = str(it.get("chunk_id", ""))
+        page_fallback = int(it.get("page", 0) or 0)
+        sim = float(it.get("similarity", 0.0))
+        images = it.get("images") or []
+
+        for idx, img in enumerate(images):
+            page = int(img.get("page", page_fallback) or page_fallback)
+
+            g = global_stats.get((cid, idx), {"score": 0.5, "votes": 0})
+            pq = perq_stats.get((cid, idx, qid), {"score": 0.5, "votes": 0})
+
+            gscore, gv = float(g.get("score", 0.5)), int(g.get("votes", 0))
+            pqscore, pqv = float(pq.get("score", 0.5)), int(pq.get("votes", 0))
+
+            comb = combined_helpfulness(gscore, gv, pqscore, pqv)
+            conf = (confidence_weight(gv) + confidence_weight(pqv)) / 2.0
+            # Confidence-weighted ranking: usefulness dominates, similarity tiebreaker
+            final_rank = comb * (0.7 + 0.3 * conf) + 0.08 * sim
+
+            diagrams.append({
+                "chunk_id": cid,
+                "img_index": idx,
+                "page": page,
+                "img_b64": img.get("b64"),
+                "similarity": sim,
+                "global_score": gscore,
+                "global_votes": gv,
+                "perq_score": pqscore,
+                "perq_votes": pqv,
+                "combined_score": comb,
+                "confidence": conf,
+                "rank": final_rank,
+            })
+
+    diagrams.sort(key=lambda d: float(d.get("rank", 0.0)), reverse=True)
+    return diagrams
 
 # =========================
 # Chat UI
@@ -467,10 +531,21 @@ def chat_ui():
         st.info("Upload a PDF and rebuild the knowledge base to begin.")
         return
 
-    q = st.text_input("Ask The Vaillant Brain a question")
-    if st.button("Ask") and q:
+    q = st.text_input("Ask The Vaillant Brain a question", key="question_text", on_change=on_question_edit)
+
+    if st.button("Ask", type="primary") and q:
+        if not require_openai_key():
+            return
+
+        qid = compute_question_id(q)
+        st.session_state.question_id = qid
+
         ctx = retrieve(q)
         st.session_state.retrieved_items = ctx
+
+        # Build + cache diagrams for this question to prevent “stale diagrams”
+        diagrams = build_diagrams_for_question(qid, ctx)
+        st.session_state.question_diagram_cache[qid] = diagrams
 
         manual_text = "\n\n".join(
             f"[Page {c['page']}]\n{c['text']}" for c in ctx
@@ -490,79 +565,111 @@ def chat_ui():
         st.markdown("### ✅ Answer")
         st.markdown(st.session_state.answer)
 
-    # Show retrieval + diagram quality summary
-    if st.session_state.retrieved_items:
-        with st.expander("🔎 Retrieval details (incl. diagram quality)", expanded=False):
-            for i, it in enumerate(st.session_state.retrieved_items, start=1):
+    # =========================
+    # Diagrams (sorted by usefulness)
+    # =========================
+    qid = st.session_state.get("question_id")
+    if not qid:
+        return
+
+    diagrams = st.session_state.question_diagram_cache.get(qid, [])
+    if not diagrams:
+        return
+
+    st.markdown("### 📷 Related diagrams (highest usefulness first)")
+
+    pdf_name = st.session_state.get("manual_pdf_name") or (
+        os.path.basename(st.session_state.get("manual_pdf_path") or "manual.pdf")
+    )
+
+    hide_bad = bool(st.session_state.get("hide_bad_images", True))
+    hide_thr = float(st.session_state.get("hide_bad_images_threshold", 0.25))
+    hide_min_votes = int(st.session_state.get("hide_bad_min_votes", 3))
+    force_div = bool(st.session_state.get("force_diversity_pages", True))
+    show_why = bool(st.session_state.get("show_why_overlay", True))
+    max_show = int(st.session_state.get("max_images_to_show", 12))
+
+    shown = 0
+    seen_pages = set()
+
+    for d in diagrams:
+        if shown >= max_show:
+            break
+
+        page = int(d.get("page", 0) or 0)
+        if force_div and page in seen_pages:
+            continue
+
+        combined = float(d.get("combined_score", 0.5))
+        gv = int(d.get("global_votes", 0))
+        pqv = int(d.get("perq_votes", 0))
+        total_votes = gv + pqv
+
+        if hide_bad and total_votes >= hide_min_votes and combined < hide_thr:
+            continue
+
+        img_b64 = d.get("img_b64")
+        if not img_b64:
+            continue
+
+        seen_pages.add(page)
+        shown += 1
+
+        img_bytes = b64_to_bytes(img_b64)
+        st.image(img_bytes, use_container_width=True)
+
+        # Required label
+        st.caption(
+            f"**Document:** {pdf_name}  \n"
+            f"**Recommended page:** Page {page}  \n"
+            f"**Diagram helpfulness:** {combined:.2f} (votes: {total_votes})"
+        )
+
+        link = pdf_page_link(page)
+        if link:
+            st.markdown(f"[Open PDF at page {page}]({link})")
+
+        if show_why:
+            with st.expander("Why this image was shown", expanded=False):
                 st.write(
-                    f"{i}. Page {it.get('page')} | sim={it.get('similarity', 0):.3f} "
-                    f"| img_score={it.get('img_avg_score', 0.5):.2f} (votes={it.get('img_votes',0)}) "
-                    f"| final={it.get('final_score', it.get('similarity',0)):.3f}"
+                    f"- Retrieval similarity: **{float(d.get('similarity', 0.0)):.3f}**\n"
+                    f"- Global score: **{float(d.get('global_score', 0.5)):.2f}** (votes: {gv})\n"
+                    f"- Per-question score: **{float(d.get('perq_score', 0.5)):.2f}** (votes: {pqv})\n"
+                    f"- Combined helpfulness: **{combined:.2f}**\n"
+                    f"- Confidence weight: **{float(d.get('confidence', 0.0)):.2f}**\n"
+                    f"- Final rank: **{float(d.get('rank', 0.0)):.3f}**"
                 )
 
-    # Diagrams
-    if st.session_state.retrieved_items:
-        st.markdown("### 📷 Related diagrams")
+        # ✅ usefulness radio button on EVERY image
+        img_key = (str(d["chunk_id"]), int(d["img_index"]))
+        widget_key = f"imgfb_{d['chunk_id']}_{d['img_index']}_{qid}"  # include qid so it doesn't get “stuck”
 
-        pdf_name = os.path.basename(st.session_state.manual_pdf_path)
-        stats = get_image_feedback_stats()
-        hide_bad = bool(st.session_state.get("hide_bad_images", True))
-        hide_thr = float(st.session_state.get("hide_bad_images_threshold", 0.25))
-
-        for it in st.session_state.retrieved_items:
-            chunk_id = str(it.get("chunk_id"))
-            images = it.get("images") or []
-            page_fallback = it.get("page", "?")
-
-            if not images:
-                continue
-
-            # sort images: higher helpfulness first (unknown = 0.5)
-            def img_sort_key(idx_img: Tuple[int, Dict[str, Any]]) -> float:
-                idx, _img = idx_img
-                d = stats.get((chunk_id, idx))
-                return float(d.get("score", 0.5)) if d else 0.5
-
-            images_sorted = list(enumerate(images))
-            images_sorted.sort(key=img_sort_key, reverse=True)
-
-            for idx, img in images_sorted:
-                img_bytes = b64_to_bytes(img["b64"])
-                page = img.get("page", page_fallback)
-
-                fb = stats.get((chunk_id, idx))
-                score = float(fb.get("score", 0.5)) if fb else 0.5
-                votes = int(fb.get("n", 0)) if fb else 0
-
-                # optional hide
-                if hide_bad and votes >= 3 and score <= hide_thr:
-                    st.caption(
-                        f"🚫 Hidden down-voted diagram (score={score:.2f}, votes={votes}) "
-                        f"— Document: {pdf_name}, Page {page}"
-                    )
-                    continue
-
-                st.image(img_bytes, use_container_width=True)
-
-                st.caption(
-                    f"**Document:** {pdf_name}  \n"
-                    f"**Recommended page:** Page {page}  \n"
-                    f"**Diagram helpfulness:** {score:.2f} (votes: {votes})"
+        # If already voted this session, show what they chose (read-only)
+        if img_key in st.session_state.image_feedback_given:
+            st.caption("✅ Feedback recorded for this diagram.")
+        else:
+            choice = st.radio(
+                "Was this image helpful?",
+                ["👍 Yes", "👎 No"],
+                index=None,
+                key=widget_key,
+                horizontal=True,
+            )
+            if choice:
+                save_image_feedback(
+                    chunk_id=str(d["chunk_id"]),
+                    img_index=int(d["img_index"]),
+                    helpful=choice.startswith("👍"),
+                    question_id=qid,
                 )
+                st.session_state.image_feedback_given.add(img_key)
 
-                img_key = (chunk_id, idx)
-                if img_key not in st.session_state.image_feedback_given:
-                    choice = st.radio(
-                        "Was this image helpful?",
-                        ["👍 Yes", "👎 No"],
-                        index=None,
-                        key=f"imgfb_{chunk_id}_{idx}",
-                        horizontal=True,
-                    )
-                    if choice:
-                        save_image_feedback(chunk_id, idx, choice.startswith("👍"))
-                        st.session_state.image_feedback_given.add(img_key)
-                        st.success("Image feedback saved")
+                # update the cached scores live by rebuilding diagrams for this qid
+                ctx = st.session_state.get("retrieved_items", [])
+                st.session_state.question_diagram_cache[qid] = build_diagrams_for_question(qid, ctx)
+
+                st.success("Image feedback saved")
+                st.rerun()
 
 # =========================
 # Main
